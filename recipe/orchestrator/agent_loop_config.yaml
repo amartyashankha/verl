@@ -1,0 +1,10 @@
+# Optional: Override agent loop configuration
+# This file allows you to register custom agent loops without modifying code
+
+# Example: Register a custom orchestrator variant
+# - name: orchestrator_coding_agent_v2
+#   _target_: recipe.orchestrator.custom_agent.OrchestratorV2Agent
+#   custom_param: value
+
+# Currently, orchestrator_coding_agent is registered via @register decorator
+# in verl/experimental/agent_loop/orchestrator_coding_agent_loop.py
