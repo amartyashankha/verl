@@ -138,7 +138,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 }
             )
             init_data = init_response.json()
-            if init_data.get("status") != "success":
+            if not init_data.get("success"):
                 logger.error(f"Failed to initialize Modal sandbox: {init_data}")
                 # TODO: Decide how to handle initialization failure
                 raise RuntimeError(f"Failed to initialize Modal sandbox: {init_data}")
@@ -410,12 +410,14 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         multi_modal_data = {"image": image_data} if image_data is not None else {}
 
         # TOREVIEW (Shankha): Extract solution and terminate sandbox
-        # TODO (Shankha): Implement solution extraction from Modal
-        # This will be used for reward computation in the standard pipeline
+        # Step 1: Get the solution patch for reward computation
+        # Step 2: Terminate the sandbox to free resources
+        # These are separate endpoints for clean separation of concerns
         solution_patch = ""
         solution_metadata = {}
         
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
+            # Step 1: Get solution patch
             try:
                 # Call Modal endpoint to get solution patch
                 # This endpoint returns the git diff of changes made in the sandbox
@@ -430,7 +432,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 
                 if solution_response.status_code == 200:
                     solution_data = solution_response.json()
-                    if solution_data.get("status") == "success":
+                    if solution_data.get("success"):
                         solution_patch = solution_data.get("patch", "")
                         solution_metadata = solution_data.get("metadata", {})
                         logger.info(f"Successfully extracted solution patch for {instance_id}")
@@ -441,9 +443,9 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     
             except Exception as e:
                 logger.error(f"Error extracting solution: {e}")
-                # Continue with empty solution patch
+                # Continue with empty solution patch - reward computation will handle this
             
-            # TODO (Shankha): Terminate sandbox to free resources
+            # Step 2: Terminate sandbox (separate from solution extraction)
             try:
                 terminate_response = await client.post(
                     f"{self.modal_base_url}-terminate-sandbox.modal.run",
@@ -459,7 +461,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     logger.warning(f"Sandbox termination returned status {terminate_response.status_code}")
             except Exception as e:
                 logger.error(f"Error terminating sandbox: {e}")
-                # Non-critical error, continue
+                # Non-critical error - sandbox will eventually timeout
         
         # TOREVIEW (Shankha): Include solution patch in metrics for reward computation
         # TODO (Shankha): Consider if this is the best way to pass the solution

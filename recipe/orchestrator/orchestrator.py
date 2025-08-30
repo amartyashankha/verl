@@ -98,6 +98,9 @@ Begin by understanding the problem and implementing a solution."""
             "instance_id": instance_id,
             "run_id": f"run_{instance_id}",
             "notebook_id": "main",
+            # Dataset information for evaluation
+            "dataset_name": row.get("dataset_name", "princeton-nlp/SWE-bench_Verified"),
+            "split": row.get("split", "test"),
             # Pass truncation config to the agent
             "agent_config": {
                 "enable_truncation": self.enable_truncation,
@@ -113,6 +116,11 @@ async def compute_score(data_dict: dict, response: Union[str, list[dict]], grade
     
     This is called after the agent completes its notebook execution.
     The solution patch is extracted by the agent loop and passed through the pipeline.
+    
+    Scoring strategy:
+    - Resolved instance: 1.0
+    - Not resolved but some tests pass: Up to 0.5 (based on % of tests passed)
+    - No patch or evaluation failure: 0.0
     """
     import httpx
     
@@ -136,49 +144,69 @@ async def compute_score(data_dict: dict, response: Union[str, list[dict]], grade
     
     # TODO (Shankha): Get Modal endpoint URL from config
     # This should come from the orchestrator config, not hardcoded
-    modal_reward_url = "https://fairies--incremental-leader-agent-api-compute-reward.modal.run"
+    modal_evaluation_url = "https://fairies--swebench-evaluation-service-evaluate-patch.modal.run"
     
     try:
-        # TODO (Shankha): Call Modal reward computation endpoint
-        async with httpx.AsyncClient(timeout=300) as client:
+        # Call Modal evaluation endpoint for SWE-bench instances
+        async with httpx.AsyncClient(timeout=600) as client:  # Increased timeout for evaluation
             reward_response = await client.post(
-                modal_reward_url,
+                modal_evaluation_url,
                 json={
                     "instance_id": data_dict.get("instance_id"),
-                    "solution_patch": solution_patch,
-                    "ground_truth": data_dict.get("ground_truth", ""),
-                    "test_cases": data_dict.get("test_cases", []),
-                    # TODO (Shankha): Add additional context if needed
-                    "metadata": solution_metadata,
-                    "problem": data_dict.get("problem", ""),
+                    "patch": solution_patch,
+                    "dataset_name": data_dict.get("dataset_name", "princeton-nlp/SWE-bench_Verified"),
+                    "split": data_dict.get("split", "test"),
+                    # Run ID can be passed for tracking
+                    "run_id": data_dict.get("run_id", f"verl_eval_{data_dict.get('instance_id', 'unknown')}")
                 }
             )
             
             if reward_response.status_code == 200:
                 reward_data = reward_response.json()
-                score = reward_data.get("score", 0.0)
                 
-                # TODO (Shankha): Extract additional information from reward response
-                # For example: test results, execution logs, etc.
-                if "details" in reward_data:
-                    logger.info(f"Reward details: {reward_data['details']}")
+                # Check if evaluation was successful
+                if not reward_data.get("success", False):
+                    logger.error(f"Evaluation failed: {reward_data.get('error', 'Unknown error')}")
+                    return 0.0
                 
-                # TODO (Shankha): Consider normalizing score to [0, 1] range
-                # The Modal endpoint might return different score ranges
-                score = max(0.0, min(1.0, score))
+                # Extract evaluation results
+                resolved = reward_data.get("resolved", False)
+                test_results = reward_data.get("test_results", {})
+                execution_time = reward_data.get("execution_time", 0)
+                
+                # Log evaluation details
+                logger.info(f"Evaluation completed in {execution_time:.2f}s")
+                logger.info(f"Instance resolved: {resolved}")
+                logger.info(f"Test results: {test_results}")
+                
+                # Convert resolution status to score
+                # TODO (Shankha): Consider more nuanced scoring based on test results
+                # For now: resolved = 1.0, not resolved = 0.0
+                score = 1.0 if resolved else 0.0
+                
+                # Optional: Partial credit based on test results
+                if not resolved and test_results:
+                    # Count passed tests for partial credit
+                    total_tests = len(test_results)
+                    passed_tests = sum(1 for result in test_results.values() if result == "PASSED")
+                    if total_tests > 0:
+                        partial_score = passed_tests / total_tests * 0.5  # Max 0.5 for partial success
+                        score = max(score, partial_score)
+                        logger.info(f"Partial credit: {passed_tests}/{total_tests} tests passed = {partial_score}")
                 
                 return score
             else:
-                logger.error(f"Reward computation failed with status {reward_response.status_code}")
+                logger.error(f"Evaluation request failed with status {reward_response.status_code}")
                 logger.error(f"Response: {reward_response.text}")
                 return 0.0
                 
     except httpx.TimeoutException:
-        logger.error("Reward computation timed out")
+        logger.error("Evaluation timed out after 600 seconds")
         # TODO (Shankha): Implement retry logic or fallback scoring
+        # Evaluation can take several minutes for complex patches
         return 0.0
     except Exception as e:
-        logger.error(f"Error computing reward: {e}")
+        logger.error(f"Error during evaluation: {e}")
         # TODO (Shankha): Decide if we should raise or return default score
         return 0.0
 
