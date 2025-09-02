@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re  # Added for code block extraction
+from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
@@ -103,6 +104,25 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         cls.response_length = config.actor_rollout_ref.rollout.response_length
         cls.system_prompt = tokenizer.apply_chat_template(
             [{}], add_generation_prompt=False, tokenize=True, **cls.apply_chat_template_kwargs
+        )
+
+        # TOREVIEW (Jeffrey) Initialize LRU cache for tokenization
+        cls.enable_tokenization_cache = config.actor_rollout_ref.rollout.multi_turn.get("enable_tokenization_cache", True)
+        cls._cached_apply_chat_template = lru_cache(maxsize=1000)( # could probably make maxsize larger if you wanted
+            cls._apply_chat_template_worker
+        )
+    
+    @classmethod
+    def _apply_chat_template_worker(cls, messages_tuple, processor_kwargs_tuple):
+        # Convert back from tuples (since lru_cache needs hashable arguments)
+        messages = list(messages_tuple)
+        processor_kwargs = dict(processor_kwargs_tuple)
+        
+        return cls.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **processor_kwargs,
         )
 
     @rollout_trace_op
@@ -195,19 +215,27 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     truncated_messages = await self._apply_truncation(conversation_messages)
                     
                     # Re-tokenize the truncated conversation
-                    # TODO (Shankha): This re-tokenization might be expensive, consider caching
+                    # TOREVIEW (Jeffrey): Added lru_cache for tokenization caching
                     if self.processor is not None:
-                        raw_prompt = await self.loop.run_in_executor(
-                            None,
-                            lambda: self.processor.apply_chat_template(
-                                truncated_messages,
-                                add_generation_prompt=True,
-                                tokenize=False,
-                                **self.apply_chat_template_kwargs,
-                            ),
-                        )
-                        model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
-                        prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+                        if self.enable_tokenization_cache and self._cached_apply_chat_template:
+                            # caching on
+                            messages_tuple = tuple(truncated_messages)
+                            kwargs_tuple = tuple(sorted(self.apply_chat_template_kwargs.items()))
+                            raw_prompt = await self.loop.run_in_executor(
+                                None,
+                                lambda: self._cached_apply_chat_template(messages_tuple, kwargs_tuple)
+                            )
+                        else:
+                            # caching off
+                            raw_prompt = await self.loop.run_in_executor(
+                                None,
+                                lambda: self.processor.apply_chat_template(
+                                    truncated_messages,
+                                    add_generation_prompt=True,
+                                    tokenize=False,
+                                    **self.apply_chat_template_kwargs,
+                                ),
+                            )
                     else:
                         prompt_ids = await self.loop.run_in_executor(
                             None,
