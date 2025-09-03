@@ -40,17 +40,21 @@ class OrchestratorDataset(RLHFDataset):
     
     def __init__(self, data_files, tokenizer, prompt_key="query", response_key="response", 
                  apply_chat_template=None, enable_truncation=False, truncation_strategy="ast_llm_compaction",
-                 truncation_max_tokens=16000, **kwargs):
+                 truncation_max_tokens=16000, modal_base_url=None, modal_evaluation_url=None, **kwargs):
         """Initialize orchestrator dataset.
         
         Args:
             enable_truncation: Whether to enable conversation truncation during training
             truncation_strategy: Which truncation strategy to use
             truncation_max_tokens: Maximum tokens before truncation
+            modal_base_url: Base URL for Modal sandbox services
+            modal_evaluation_url: URL for Modal evaluation service
         """
         self.enable_truncation = enable_truncation
         self.truncation_strategy = truncation_strategy
         self.truncation_max_tokens = truncation_max_tokens
+        self.modal_base_url = modal_base_url
+        self.modal_evaluation_url = modal_evaluation_url
         
         super().__init__(data_files, tokenizer, prompt_key, response_key, 
                          apply_chat_template, **kwargs)
@@ -106,7 +110,10 @@ Begin by understanding the problem and implementing a solution."""
                 "enable_truncation": self.enable_truncation,
                 "truncation_strategy": self.truncation_strategy,
                 "truncation_max_tokens": self.truncation_max_tokens,
-            }
+            },
+            # Pass Modal configuration for evaluation
+            "modal_base_url": self.modal_base_url,
+            "modal_evaluation_url": self.modal_evaluation_url
         }
         return data
 
@@ -142,9 +149,8 @@ async def compute_score(data_dict: dict, response: Union[str, list[dict]], grade
         # For example, try to extract from response text
         return 0.0
     
-    # TODO (Shankha): Get Modal endpoint URL from config
-    # This should come from the orchestrator config, not hardcoded
-    modal_evaluation_url = "https://fairies--swebench-evaluation-service-evaluate-patch.modal.run"
+    # TOREVIEW (Jeffrey): Get Modal evaluation URL from config
+    modal_evaluation_url = data_dict.get("modal_evaluation_url", "https://fairies--evaluation-service-evaluate-patch.modal.run")
     
     try:
         # Call Modal evaluation endpoint for SWE-bench instances

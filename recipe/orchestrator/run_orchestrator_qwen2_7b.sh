@@ -1,6 +1,40 @@
 #!/bin/bash
 set -x
 
+# ================= Environment Setup =================
+echo "Setting up Python environment with uv..."
+
+# Install uv if not already installed
+if ! command -v uv &> /dev/null; then
+    echo "Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # Add uv to PATH for current session
+    export PATH="$HOME/.cargo/bin:$PATH"
+else
+    echo "uv already installed"
+fi
+
+# Ensure we're in the right directory (this repo)
+cd "$(dirname "$0")/../.." || exit 1
+echo "Working directory: $(pwd)"
+
+# Create uv environment from pyproject.toml and install requirements
+echo "Creating uv environment and installing dependencies..."
+uv venv
+source .venv/bin/activate
+
+# Install requirements from requirements.txt to be sure
+echo "Installing additional requirements..."
+uv pip install -r requirements.txt
+
+# Verify verl package is available
+python3 -c "import verl; print('✓ VERL package available')" || {
+    echo "❌ Failed to import VERL package"
+    exit 1
+}
+
+echo "✓ Environment setup complete"
+
 export VLLM_USE_V1=1
 
 # ================= data/model/config =================
@@ -17,6 +51,7 @@ model_path=$HDFS_ROOT/checkpoint/qwen-2.5-7b-instruct
 # Modal configuration
 modal_base_url="https://fairies--incremental-leader-agent-api"
 modal_timeout=300
+modal_evaluation_url="https://fairies--evaluation-service-evaluate-patch.modal.run"
 
 # Agent loop configuration
 agent_loop_config_path=recipe/orchestrator/agent_loop_config.yaml
@@ -75,6 +110,8 @@ python3 -m verl.trainer.main_ppo \
     data.custom_cls.kwargs.enable_truncation=$enable_truncation \
     data.custom_cls.kwargs.truncation_strategy=$truncation_strategy \
     data.custom_cls.kwargs.truncation_max_tokens=$truncation_max_tokens \
+    data.custom_cls.kwargs.modal_base_url=$modal_base_url \
+    data.custom_cls.kwargs.modal_evaluation_url=$modal_evaluation_url \
     custom_reward_function.path=recipe/orchestrator/orchestrator.py \
     custom_reward_function.name=compute_score \
     actor_rollout_ref.model.path=$model_path \
@@ -98,6 +135,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$max_turns \
     actor_rollout_ref.rollout.multi_turn.modal_base_url=$modal_base_url \
     actor_rollout_ref.rollout.multi_turn.modal_timeout=$modal_timeout \
+    actor_rollout_ref.rollout.multi_turn.modal_evaluation_url=$modal_evaluation_url \
     actor_rollout_ref.rollout.multi_turn.enable_truncation=$enable_truncation \
     actor_rollout_ref.rollout.multi_turn.truncation_strategy=$truncation_strategy \
     actor_rollout_ref.rollout.multi_turn.truncation_max_tokens=$truncation_max_tokens \
