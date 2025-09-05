@@ -30,6 +30,8 @@ source .venv/bin/activate
 echo "Installing additional requirements..."
 uv pip install -r requirements.txt
 
+# Note: claude_thinking_python is optional and locally provided; no pip install here
+
 # Verify verl package is available
 python3 -c "import verl; print('✓ VERL package available')" || {
     echo "❌ Failed to import VERL package"
@@ -51,10 +53,10 @@ test_files="['$DATA_ROOT/dataset/orchestrator/test.json']"
 # Model path - use your local SFT model
 model_path=$DATA_ROOT/checkpoint/qwen-2.5-14b-instruct-sft
 
-# Modal configuration
-modal_base_url="https://fairies--incremental-leader-agent-api"
+# Modal configuration: prefix only (the agent loop appends -*.modal.run)
+modal_base_url="https://fairies--incremental-leader-agent-api" # with or without the -run?
 modal_timeout=300
-modal_evaluation_url="https://fairies--evaluation-service-evaluate-patch.modal.run"
+modal_evaluation_url="https://fairies--swe-gym-evaluation-service-polling-evaluate-patch.modal.run"
 
 # Agent loop configuration
 agent_loop_config_path=recipe/orchestrator/agent_loop_config.yaml
@@ -92,7 +94,7 @@ truncation_max_tokens=16000
 # ================= performance =================
 infer_tp=8  # vllm tensor parallel - increase for 14B model
 train_sp=8  # train sequence parallel - increase for 14B model
-offload=True
+offload=False
 
 # actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) / 2 ))
 # log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
@@ -114,16 +116,19 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='error' \
     data.custom_cls.path=recipe/orchestrator/orchestrator.py \
     data.custom_cls.name=OrchestratorDataset \
-    data.custom_cls.kwargs.enable_truncation=$enable_truncation \
-    data.custom_cls.kwargs.truncation_strategy=$truncation_strategy \
-    data.custom_cls.kwargs.truncation_max_tokens=$truncation_max_tokens \
-    data.custom_cls.kwargs.modal_base_url=$modal_base_url \
-    data.custom_cls.kwargs.modal_evaluation_url=$modal_evaluation_url \
+    +data.custom_cls.kwargs.enable_truncation=$enable_truncation \
+    +data.custom_cls.kwargs.truncation_strategy=$truncation_strategy \
+    +data.custom_cls.kwargs.truncation_max_tokens=$truncation_max_tokens \
+    +data.custom_cls.kwargs.modal_base_url=$modal_base_url \
+    +data.custom_cls.kwargs.modal_evaluation_url=$modal_evaluation_url \
     custom_reward_function.path=recipe/orchestrator/orchestrator.py \
     custom_reward_function.name=compute_score \
+    reward_model.enable=False \
     actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.hybrid_engine=True \
+    actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.actor.use_kl_loss=$use_kl_loss \
     actor_rollout_ref.actor.kl_loss_coef=$kl_loss_coef \
     actor_rollout_ref.actor.optim.lr=$actor_lr \
@@ -140,13 +145,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$max_turns \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$max_turns \
-    actor_rollout_ref.rollout.multi_turn.modal_base_url=$modal_base_url \
-    actor_rollout_ref.rollout.multi_turn.modal_timeout=$modal_timeout \
-    actor_rollout_ref.rollout.multi_turn.modal_evaluation_url=$modal_evaluation_url \
-    actor_rollout_ref.rollout.multi_turn.enable_truncation=$enable_truncation \
-    actor_rollout_ref.rollout.multi_turn.truncation_strategy=$truncation_strategy \
-    actor_rollout_ref.rollout.multi_turn.truncation_max_tokens=$truncation_max_tokens \
+    +actor_rollout_ref.rollout.multi_turn.modal_base_url=$modal_base_url \
+    +actor_rollout_ref.rollout.multi_turn.modal_timeout=$modal_timeout \
+    +actor_rollout_ref.rollout.multi_turn.modal_evaluation_url=$modal_evaluation_url \
+    +actor_rollout_ref.rollout.multi_turn.enable_truncation=$enable_truncation \
+    +actor_rollout_ref.rollout.multi_turn.truncation_strategy=$truncation_strategy \
+    +actor_rollout_ref.rollout.multi_turn.truncation_max_tokens=$truncation_max_tokens \
     actor_rollout_ref.rollout.multi_turn.format=default \
+    actor_rollout_ref.rollout.multi_turn._target_=verl.workers.config.rollout.OrchestratorMultiTurnConfig \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
@@ -156,7 +162,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     critic.model.path=$model_path \
-    trainer.logger=['console','wandb'] \
+    critic.strategy=fsdp \
+    trainer.logger=['console'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=8 \

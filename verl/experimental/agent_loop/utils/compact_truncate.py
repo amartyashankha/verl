@@ -9,7 +9,10 @@ from functools import partial
 import torch
 from transformers import AutoTokenizer
 from collections import defaultdict
-from claude_thinking_python import ClaudeThinkingClient
+try:
+    from .claude_thinking_python import ClaudeThinkingClient  # type: ignore
+except ModuleNotFoundError:
+    ClaudeThinkingClient = None  # Fallback: allow running without Claude client
 import psutil
 import time
 import logging
@@ -501,27 +504,35 @@ def truncate_strategy_4_ast_llm_compaction(messages: List[Dict], is_subleader: b
         all_variables, all_functions, all_classes, all_imports, len(messages)
     )
     
-    # Use LLM to generate summary
-    claude_client = ClaudeThinkingClient()
-    summary_messages = messages + [{
-        "role": "user",
-        "content": summary_prompt
-    }]
-    
-    summary_response = claude_client.call_llm(
-        messages=summary_messages,
-        system="You are a helpful assistant that summarizes conversations.",
-        model="claude-sonnet-4-20250514",
-        temperature=1.0,
-        max_tokens=20000,
-        tools=None,
-        thinking_budget_tokens=1024,
-        stream=False
-    )
-    summary_text = summary_response.get("output", "")
+    # Use LLM to generate summary if available; otherwise perform a lightweight fallback
+    if ClaudeThinkingClient is None:
+        formatted_summary = (
+            "Conversation too long. Summarized with local fallback.\n"
+            f"Messages: {len(messages)}. Variables: {len(all_variables)}. "
+            f"Functions: {len(all_functions)}. Classes: {len(all_classes)}. "
+            f"Imports: {len(all_imports)}."
+        )
+    else:
+        claude_client = ClaudeThinkingClient()
+        summary_messages = messages + [{
+            "role": "user",
+            "content": summary_prompt
+        }]
+        
+        summary_response = claude_client.call_llm(
+            messages=summary_messages,
+            system="You are a helpful assistant that summarizes conversations.",
+            model="claude-sonnet-4-20250514",
+            temperature=1.0,
+            max_tokens=20000,
+            tools=None,
+            thinking_budget_tokens=1024,
+            stream=False
+        )
+        summary_text = summary_response.get("output", "")
 
-    # Format the summary
-    formatted_summary = format_summary(summary_text)
+        # Format the summary
+        formatted_summary = format_summary(summary_text)
     
     # Calculate original message size
     original_size = len(json.dumps(messages))

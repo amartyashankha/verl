@@ -91,6 +91,48 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         cls.modal_timeout = config.actor_rollout_ref.rollout.multi_turn.get("modal_timeout", 300)
         cls.code_pattern = re.compile(r'<code>(.*?)</code>', re.DOTALL)  # TOREVIEW (Shankha): Pattern to extract code blocks
         print(f"Initialized Modal agent with base URL: {cls.modal_base_url}")
+
+        # Normalize modal endpoint helpers to avoid malformed hostnames
+        def _compose_endpoint(path_suffix: str) -> str:
+            base = cls.modal_base_url.rstrip('/')
+            # Accept callers passing leading "-" or "/" and normalize once
+            normalized_suffix = path_suffix.lstrip('/-')
+            if base.endswith('.modal.run'):
+                # Full domain provided: use path-based endpoints
+                return f"{base}/{normalized_suffix}"
+            # Prefix provided: construct subdomain per Modal convention
+            return f"{base}-{normalized_suffix}.modal.run"
+
+        cls._endpoint = staticmethod(_compose_endpoint)
+
+        # Preflight check to validate endpoint reachability early
+        try:
+            with httpx.Client(timeout=min(10.0, float(cls.modal_timeout))) as _client:
+                preflight_targets = {
+                    "init": cls._endpoint("-init-sandbox"),
+                    "exec": cls._endpoint("-execute-cell"),
+                    "patch": cls._endpoint("-get-solution-patch"),
+                    "term": cls._endpoint("-terminate-sandbox"),
+                }
+                for name, url in preflight_targets.items():
+                    try:
+                        # Any HTTP response proves DNS/TLS reachability; status can be 404/405 for HEAD
+                        _ = _client.head(url)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Modal preflight failed for '{name}' at {url}: {e}"
+                        )
+                # Heuristic warning if a likely inference domain is used for sandbox APIs
+                if cls.modal_base_url.endswith('.modal.run') and (
+                    'inference' in cls.modal_base_url or 'vllm' in cls.modal_base_url
+                ):
+                    logger.warning(
+                        "modal_base_url appears to point to an inference service; sandbox endpoints may not exist: %s",
+                        cls.modal_base_url,
+                    )
+        except Exception as preflight_err:
+            # Fail fast with a clear error; upstream trainer will surface this
+            raise
         
         # TOREVIEW (Shankha): Initialize truncation configuration for AST-based compaction
         cls.truncation_strategy = config.actor_rollout_ref.rollout.multi_turn.get("truncation_strategy", None)
@@ -150,7 +192,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
             # TOREVIEW (Shankha): Initialize the sandbox for this agent
             init_response = await client.post(
-                f"{self.modal_base_url}-init-sandbox.modal.run",
+                self._endpoint("-init-sandbox"),
                 json={
                     "instance_id": instance_id,
                     "run_id": run_id,
@@ -307,7 +349,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                         try:
                             # TOREVIEW (Shankha): Execute code via Modal API
                             exec_response = await client.post(
-                                f"{self.modal_base_url}-execute-cell.modal.run",
+                                self._endpoint("-execute-cell"),
                                 json={
                                     "instance_id": instance_id,
                                     "run_id": run_id,
@@ -453,7 +495,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 # Call Modal endpoint to get solution patch
                 # This endpoint returns the git diff of changes made in the sandbox
                 solution_response = await client.post(
-                    f"{self.modal_base_url}-get-solution-patch.modal.run",
+                    self._endpoint("-get-solution-patch"),
                     json={
                         "instance_id": instance_id,
                         "run_id": run_id,
@@ -479,7 +521,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             # Step 2: Terminate sandbox (separate from solution extraction)
             try:
                 terminate_response = await client.post(
-                    f"{self.modal_base_url}-terminate-sandbox.modal.run",
+                    self._endpoint("-terminate-sandbox"),
                     json={
                         "instance_id": instance_id,
                         "run_id": run_id,
