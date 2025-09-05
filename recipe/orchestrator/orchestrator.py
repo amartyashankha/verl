@@ -91,6 +91,8 @@ Begin by understanding the problem and implementing a solution."""
         data = {
             "data_source": row.get("data_source", "orchestrator_dataset"),
             "prompt": [{"role": "user", "content": prompt_content}],
+            # Provide a clean task prompt for initializing the notebook first cell
+            "task_prompt": problem,
             "ability": row.get("ability", "CODING"),
             "reward_model": {
                 "ground_truth": row.get("ground_truth", row.get("answer", "")),

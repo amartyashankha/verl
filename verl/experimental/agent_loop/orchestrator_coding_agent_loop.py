@@ -140,6 +140,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         instance_id = kwargs.get("instance_id", "default_instance")
         run_id = kwargs.get("run_id", f"run_{request_id}")
         notebook_id = kwargs.get("notebook_id", "main")
+        task_prompt = kwargs.get("task_prompt", None)
         
         # TOREVIEW (Shankha): Check if httpx is available
         if httpx is None:
@@ -154,7 +155,9 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     "instance_id": instance_id,
                     "run_id": run_id,
                     "notebook_id": notebook_id,
-                    "model_endpoint": "verl"  # TODO: Get from config if needed
+                    "model_endpoint": "verl",  # TODO: Get from config if needed
+                    # Pass task_prompt to trigger first-cell creation and prompt file write
+                    **({"task_prompt": task_prompt} if task_prompt else {})
                 }
             )
             init_data = init_response.json()
