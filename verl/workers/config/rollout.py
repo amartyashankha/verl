@@ -23,6 +23,7 @@ from verl.utils.profiler import ProfilerConfig
 __all__ = [
     "SamplingConfig",
     "MultiTurnConfig",
+    "OrchestratorMultiTurnConfig",
     "CustomAsyncServerConfig",
     "AgentLoopConfig",
     "TraceConfig",
@@ -54,6 +55,21 @@ class MultiTurnConfig(BaseConfig):
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
+
+
+@dataclass
+class OrchestratorMultiTurnConfig(MultiTurnConfig):
+    """Extended MultiTurnConfig for orchestrator agent with Modal integration."""
+    
+    # Modal integration parameters
+    modal_base_url: Optional[str] = None
+    modal_timeout: int = 300
+    modal_evaluation_url: Optional[str] = None
+    
+    # Truncation parameters
+    enable_truncation: bool = False
+    truncation_strategy: Optional[str] = None
+    truncation_max_tokens: int = 16000
 
 
 @dataclass

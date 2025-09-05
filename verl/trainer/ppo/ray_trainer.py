@@ -1095,6 +1095,18 @@ class RayPPOTrainer:
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                # Log when training actually begins
+                if self.global_steps == 1 and epoch == 0:
+                    import torch
+                    if torch.cuda.is_available():
+                        for i in range(torch.cuda.device_count()):
+                            memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                            memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                            memory_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                            print(f"🚀 TRAINING BEGINS - GPU {i}: memory allocated (GB): {memory_allocated:.2f}, memory reserved (GB): {memory_reserved:.2f}, device memory used/total (GB): {memory_allocated:.2f}/{memory_total:.2f}")
+                    else:
+                        print("🚀 TRAINING BEGINS - No CUDA available")
+                
                 metrics = {}
                 timing_raw = {}
 

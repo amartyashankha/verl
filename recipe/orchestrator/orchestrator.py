@@ -29,7 +29,7 @@ from torch.nn import functional as F
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import RLHFDataset
-from verl.utils.reward_score.grader import Grader
+# from verl.utils.reward_score.grader import Grader  # Not available in current VERL version
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -38,32 +38,30 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 class OrchestratorDataset(RLHFDataset):
     """Dataset for orchestrator notebook agent with Modal sandboxes."""
     
-    def __init__(self, data_files, tokenizer, prompt_key="query", response_key="response", 
-                 apply_chat_template=None, enable_truncation=False, truncation_strategy="ast_llm_compaction",
-                 truncation_max_tokens=16000, modal_base_url=None, modal_evaluation_url=None, **kwargs):
+    def __init__(self, data_files, tokenizer, config, processor=None, **kwargs):
         """Initialize orchestrator dataset.
         
         Args:
-            enable_truncation: Whether to enable conversation truncation during training
-            truncation_strategy: Which truncation strategy to use
-            truncation_max_tokens: Maximum tokens before truncation
-            modal_base_url: Base URL for Modal sandbox services
-            modal_evaluation_url: URL for Modal evaluation service
+            data_files: Path(s) to data file(s)
+            tokenizer: Tokenizer for text processing
+            config: Configuration object containing dataset settings
+            processor: Optional processor for multimodal data
         """
-        self.enable_truncation = enable_truncation
-        self.truncation_strategy = truncation_strategy
-        self.truncation_max_tokens = truncation_max_tokens
-        self.modal_base_url = modal_base_url
-        self.modal_evaluation_url = modal_evaluation_url
+        # Extract orchestrator-specific config from the main config
+        self.enable_truncation = getattr(config, 'enable_truncation', False)
+        self.truncation_strategy = getattr(config, 'truncation_strategy', "ast_llm_compaction")
+        self.truncation_max_tokens = getattr(config, 'truncation_max_tokens', 16000)
+        self.modal_base_url = getattr(config, 'modal_base_url', None)
+        self.modal_evaluation_url = getattr(config, 'modal_evaluation_url', None)
         
-        super().__init__(data_files, tokenizer, prompt_key, response_key, 
-                         apply_chat_template, **kwargs)
+        super().__init__(data_files, tokenizer, config, processor, **kwargs)
     
     def _read_files_and_tokenize(self):
         # Load data files (could be from SWE-bench, custom datasets, etc.)
         dataframes = []
         for data_file in self.data_files:
-            dataframe = datasets.load_dataset(data_file)["train"]
+            # Specify format as 'json' to properly load JSON files
+            dataframe = datasets.load_dataset("json", data_files=data_file)["train"]
             # Process each row to add orchestrator-specific fields
             dataframe = dataframe.map(self.map_fn, num_proc=16)
             dataframes.append(dataframe)
@@ -118,7 +116,7 @@ Begin by understanding the problem and implementing a solution."""
         return data
 
 
-async def compute_score(data_dict: dict, response: Union[str, list[dict]], grader: Grader = None, **kwargs) -> float:
+async def compute_score(data_dict: dict, response: Union[str, list[dict]], grader=None, **kwargs) -> float:
     """Compute reward score for orchestrator agent responses.
     
     This is called after the agent completes its notebook execution.

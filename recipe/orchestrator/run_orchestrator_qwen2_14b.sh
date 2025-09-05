@@ -1,4 +1,7 @@
 #!/bin/bash
+
+# Suppress Hugging Face warnings about downstream training
+export TRANSFORMERS_VERBOSITY=error
 set -x
 
 # ================= Environment Setup =================
@@ -46,7 +49,7 @@ train_files="['$DATA_ROOT/dataset/orchestrator/train.json']"
 test_files="['$DATA_ROOT/dataset/orchestrator/test.json']"
 
 # Model path - use your local SFT model
-model_path=$DATA_ROOT/checkpoint/qwen-2.5-7b-instruct-sft
+model_path=$DATA_ROOT/checkpoint/qwen-2.5-14b-instruct-sft
 
 # Modal configuration
 modal_base_url="https://fairies--incremental-leader-agent-api"
@@ -58,7 +61,7 @@ agent_loop_config_path=recipe/orchestrator/agent_loop_config.yaml
 
 # wandb
 project_name=orchestrator
-experiment_name=qwen2.5-7b_orchestrator_modal
+experiment_name=qwen2.5-14b_orchestrator_modal
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -72,13 +75,14 @@ kl_loss_coef=0.1
 # Training parameters
 max_turns=20  # Allow more turns for complex notebook interactions
 max_prompt_length=4096
-max_response_length=32768  # Larger for notebook outputs
-actor_lr=5e-7
+max_response_length=2000  # Larger for notebook outputs
+max_model_len=32768  # Model's maximum context length
+actor_lr=1e-7
 
-train_batch_size=16  # Reduce for 14B model
-ppo_mini_batch_size=4  # Reduce for 14B model
-n_resp_per_prompt=2  # Reduce for 14B model
-n_resp_per_prompt_val=4  # Reduce for 14B model
+train_batch_size=8  # Reduce for 14B model (32 default)
+ppo_mini_batch_size=2  # Reduce for 14B model (8 default)
+n_resp_per_prompt=2  # Reduce for 14B model (4 default)
+n_resp_per_prompt_val=2  # Reduce for 14B model (8 default)
 
 # Truncation settings
 enable_truncation=true
@@ -90,8 +94,11 @@ infer_tp=8  # vllm tensor parallel - increase for 14B model
 train_sp=8  # train sequence parallel - increase for 14B model
 offload=True
 
-actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
-log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 2 ))  # Reduce multiplier for 14B model
+# actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) / 2 ))
+# log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
+
+actor_max_token_len_per_gpu=2000
+log_prob_max_token_len_per_gpu=2000
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$adv_estimator \
@@ -141,7 +148,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.truncation_max_tokens=$truncation_max_tokens \
     actor_rollout_ref.rollout.multi_turn.format=default \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.temperature=0.7 \
     actor_rollout_ref.rollout.top_p=0.9 \
@@ -160,6 +167,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=$default_local_dir \
     trainer.test_freq=5 \
     trainer.total_epochs=1 $@
+
+
+
 
 
 # python3 -m verl.trainer.main_ppo \
@@ -207,7 +217,7 @@ python3 -m verl.trainer.main_ppo \
 #     actor_rollout_ref.rollout.multi_turn.truncation_max_tokens=$truncation_max_tokens \
 #     actor_rollout_ref.rollout.multi_turn.format=default \
 #     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
-#     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+#     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
 #     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
 #     actor_rollout_ref.rollout.temperature=0.7 \
 #     actor_rollout_ref.rollout.top_p=0.9 \
@@ -225,8 +235,3 @@ python3 -m verl.trainer.main_ppo \
 #     trainer.default_local_dir=$default_local_dir \
 #     trainer.test_freq=5 \
 #     trainer.total_epochs=1 $@
-
-
-
-
-
