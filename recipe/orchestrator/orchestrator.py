@@ -66,11 +66,11 @@ class OrchestratorDataset(RLHFDataset):
         super().__init__(data_files, tokenizer, config, processor, **kwargs)
     
     def _preload_problem_statements(self):
-        """Pre-load problem statements from SWE-bench and SWE-Gym datasets into a cache."""
+        """Pre-load problem statements from SWE-Gym dataset into a cache."""
         try:
             from datasets import load_dataset
             
-            # Load SWE-Gym
+            # Load SWE-Gym only
             try:
                 swe_gym = load_dataset("SWE-Gym/SWE-Gym", split="train")
                 for item in swe_gym:
@@ -86,25 +86,8 @@ class OrchestratorDataset(RLHFDataset):
                             self._problem_statements_cache[instance_id] = task_prompt
             except Exception as e:
                 logger.warning(f"Failed to load SWE-Gym dataset: {e}")
-            
-            # Load SWE-bench Verified
-            try:
-                swe_bench = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
-                for item in swe_bench:
-                    instance_id = item.get("instance_id")
-                    if instance_id:
-                        # Extract problem statement
-                        task_prompt = None
-                        for key in ("problem_statement", "problem", "prompt", "title", "description"):
-                            if key in item and isinstance(item[key], str) and item[key].strip():
-                                task_prompt = item[key]
-                                break
-                        if task_prompt:
-                            self._problem_statements_cache[instance_id] = task_prompt
-            except Exception as e:
-                logger.warning(f"Failed to load SWE-bench dataset: {e}")
                 
-            logger.info(f"Pre-loaded {len(self._problem_statements_cache)} problem statements")
+            logger.info(f"Pre-loaded {len(self._problem_statements_cache)} problem statements from SWE-Gym")
         except ImportError:
             logger.warning("datasets library not available, problem statements will not be loaded")
 
@@ -151,9 +134,8 @@ class OrchestratorDataset(RLHFDataset):
         # Determine dataset based on instance_id pattern
         # SWE-Gym instances typically don't have double underscores
         # SWE-bench instances have format: repo__issue
-        is_swe_gym = "__" not in instance_id
-        dataset_name = "SWE-Gym/SWE-Gym" if is_swe_gym else "princeton-nlp/SWE-bench_Verified"
-        split = "train" if is_swe_gym else "test"
+        dataset_name = "SWE-Gym/SWE-Gym" 
+        split = "train" 
         
         # Get problem statement from cache
         task_prompt = self._problem_statements_cache.get(instance_id)

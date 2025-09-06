@@ -90,7 +90,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         # TOREVIEW (Shankha): Initialize Modal-specific configuration
         cls.modal_base_url = config.actor_rollout_ref.rollout.multi_turn.get("modal_base_url", "https://fairies--incremental-leader-agent-api")
         cls.modal_timeout = config.actor_rollout_ref.rollout.multi_turn.get("modal_timeout", 300)
-        cls.code_pattern = re.compile(r'<code>(.*?)</code>', re.DOTALL)  # TOREVIEW (Shankha): Pattern to extract code blocks
+        # TOREVIEW (Jeffrey): Removed simple regex pattern - will use proper extraction function
         print(f"Initialized Modal agent with base URL: {cls.modal_base_url}")
 
         # Normalize modal endpoint helpers to avoid malformed hostnames
@@ -142,6 +142,45 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             tokenize=False,
             **processor_kwargs,
         )
+    
+    @classmethod
+    def _extract_code_blocks(cls, response: str) -> list[str]:
+        """Extract code from <code></code> blocks in the response.
+        
+        This properly handles nested <code> blocks using a stack-based approach.
+        """
+        extracted_blocks = []
+        i = 0
+        
+        while i < len(response):
+            if response[i:i+6] == '<code>':
+                opening_positions = [i + 6]
+                i += 6
+                inner_blocks = []
+                
+                while i < len(response) and opening_positions:
+                    if response[i:i+6] == '<code>':
+                        opening_positions.append(i + 6)
+                        i += 6
+                    elif response[i:i+7] == '</code>':
+                        if opening_positions:
+                            start = opening_positions.pop()
+                            content = response[start:i]
+                            
+                            if not opening_positions:
+                                extracted_blocks.append(content)
+                            else:
+                                inner_blocks.append(content)
+                        i += 7
+                    else:
+                        i += 1
+                
+                if opening_positions and inner_blocks:
+                    extracted_blocks.extend(inner_blocks)
+            else:
+                i += 1
+        
+        return [block.strip() for block in extracted_blocks if block.strip()]
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -160,7 +199,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         run_id = kwargs.get("run_id", f"run_{request_id}")
         notebook_id = kwargs.get("notebook_id", "main")
         task_prompt = kwargs.get("task_prompt", None)
-        dataset_name = kwargs.get("dataset_name", "princeton-nlp/SWE-bench_Verified")
+        dataset_name = kwargs.get("dataset_name", "SWE-Gym/SWE-Gym")
         split = kwargs.get("split", ("train" if "swe-gym" in dataset_name.lower() else "test"))
         
         # TOREVIEW (Jeffrey): task_prompt now comes from the dataset
@@ -325,7 +364,8 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 # TOREVIEW (Shankha): Update conversation messages with assistant response
                 conversation_messages.append({"role": "assistant", "content": response_text})
                 
-                code_blocks = self.code_pattern.findall(response_text)
+                # TOREVIEW (Jeffrey): Use proper extraction function that handles nested code blocks
+                code_blocks = self._extract_code_blocks(response_text)
                 if not code_blocks:
                     break  # No code to execute
 
