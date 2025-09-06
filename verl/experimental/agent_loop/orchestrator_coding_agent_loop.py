@@ -104,35 +104,6 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             return f"{base}-{normalized_suffix}.modal.run"
 
         cls._endpoint = staticmethod(_compose_endpoint)
-
-        # Preflight check to validate endpoint reachability early
-        try:
-            with httpx.Client(timeout=min(10.0, float(cls.modal_timeout))) as _client:
-                preflight_targets = {
-                    "init": cls._endpoint("-init-sandbox"),
-                    "exec": cls._endpoint("-execute-cell"),
-                    "patch": cls._endpoint("-get-solution-patch"),
-                    "term": cls._endpoint("-terminate-sandbox"),
-                }
-                for name, url in preflight_targets.items():
-                    try:
-                        # Any HTTP response proves DNS/TLS reachability; status can be 404/405 for HEAD
-                        _ = _client.head(url)
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Modal preflight failed for '{name}' at {url}: {e}"
-                        )
-                # Heuristic warning if a likely inference domain is used for sandbox APIs
-                if cls.modal_base_url.endswith('.modal.run') and (
-                    'inference' in cls.modal_base_url or 'vllm' in cls.modal_base_url
-                ):
-                    logger.warning(
-                        "modal_base_url appears to point to an inference service; sandbox endpoints may not exist: %s",
-                        cls.modal_base_url,
-                    )
-        except Exception as preflight_err:
-            # Fail fast with a clear error; upstream trainer will surface this
-            raise
         
         # TOREVIEW (Shankha): Initialize truncation configuration for AST-based compaction
         cls.truncation_strategy = config.actor_rollout_ref.rollout.multi_turn.get("truncation_strategy", None)
@@ -183,6 +154,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         run_id = kwargs.get("run_id", f"run_{request_id}")
         notebook_id = kwargs.get("notebook_id", "main")
         task_prompt = kwargs.get("task_prompt", None)
+        dataset_name = kwargs.get("dataset_name", "princeton-nlp/SWE-bench_Verified")
         
         # TOREVIEW (Shankha): Check if httpx is available
         if httpx is None:
@@ -194,6 +166,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             init_response = await client.post(
                 self._endpoint("-init-sandbox"),
                 json={
+                    "dataset": dataset_name,
                     "instance_id": instance_id,
                     "run_id": run_id,
                     "notebook_id": notebook_id,
