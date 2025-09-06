@@ -58,6 +58,11 @@ class OrchestratorDataset(RLHFDataset):
         self.modal_base_url = getattr(config, 'modal_base_url', None)
         self.modal_evaluation_url = getattr(config, 'modal_evaluation_url', None)
         
+        # Ensure we have a valid evaluation URL
+        if not self.modal_evaluation_url:
+            self.modal_evaluation_url = "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"
+            logger.info(f"No modal_evaluation_url in config, using default: {self.modal_evaluation_url}")
+        
         # Pre-load SWE-bench/SWE-Gym datasets for efficient problem statement lookup
         self._problem_statements_cache = {}
         self._preload_problem_statements()
@@ -207,6 +212,7 @@ class OrchestratorDataset(RLHFDataset):
             "dataset_name": dataset_name,
             "split": split,
             "task_prompt": task_prompt,  # Now included in the dataset output
+            "modal_evaluation_url": self.modal_evaluation_url,  # Pass Modal evaluation URL
         }
 
     def __getitem__(self, idx):
@@ -222,112 +228,34 @@ class OrchestratorDataset(RLHFDataset):
         return row_dict
 
 
-async def compute_score(data_dict: dict, response: Union[str, list[dict]], grader=None, **kwargs) -> float:
+def compute_score(data_source: str, solution_str: str, ground_truth=None, extra_info=None, **kwargs) -> float:
     """Compute reward score for orchestrator agent responses.
     
-    This is called after the agent completes its notebook execution.
-    The solution patch is extracted by the agent loop and passed through the pipeline.
+    NOTE: The actual evaluation now happens directly in orchestrator_coding_agent_loop.py
+    This function is only called if the agent loop didn't already compute the reward.
     
-    Scoring strategy:
-    - Resolved instance: 1.0
-    - Not resolved but some tests pass: Up to 0.5 (based on % of tests passed)
-    - No patch or evaluation failure: 0.0
+    Args:
+        data_source: The data source identifier (e.g., "swegym")
+        solution_str: The model's response (not used for orchestrator)
+        ground_truth: Ground truth if available
+        extra_info: Dictionary containing metrics and other info from agent loop
+        **kwargs: Additional arguments
+    
+    Returns:
+        float: Default reward of 0.0 (actual evaluation happens in agent loop)
     """
-    import httpx
+    # Log that we're in the fallback path
+    instance_id = "unknown"
+    if extra_info:
+        if hasattr(extra_info, '__len__') and not isinstance(extra_info, dict):
+            extra_info = extra_info[0] if len(extra_info) > 0 else {}
+        instance_id = extra_info.get("instance_id", "unknown")
     
-    # TODO (Shankha): Extract solution patch from kwargs
-    # The solution patch is passed through the metrics in AgentLoopOutput
-    extra_info = kwargs.get("extra_info", {})
-    metrics = extra_info.get("metrics", {})
-    solution_patch = metrics.get("solution_patch", "")
-    solution_metadata = metrics.get("solution_metadata", {})
+    logger.info(f"Fallback reward computation for {instance_id} - returning 0.0")
+    logger.info("Note: Evaluation should have happened in orchestrator_coding_agent_loop.py")
     
-    # TODO (Shankha): Add logging to debug data flow
-    logger.info(f"Computing reward for instance {data_dict.get('instance_id')}")
-    
-    if not solution_patch:
-        logger.warning(f"No solution patch found for {data_dict.get('instance_id')}")
-        logger.warning(f"Available metrics keys: {list(extra_info.get('metrics', {}).keys())}")
-        logger.warning(f"Full metrics content: {extra_info.get('metrics', {})}")
-        return 0.0
-    
-    # Log patch details for debugging
-    patch_lines = solution_patch.split('\n')
-    logger.info(f"Solution patch for {data_dict.get('instance_id')}: {len(patch_lines)} lines, {len(solution_patch)} chars")
-    if len(patch_lines) <= 10:
-        logger.info(f"Full patch:\n{solution_patch}")
-    else:
-        logger.info(f"Patch preview (first 5 lines):\n{chr(10).join(patch_lines[:5])}")
-        logger.info(f"... ({len(patch_lines) - 10} lines omitted) ...")
-        logger.info(f"Patch preview (last 5 lines):\n{chr(10).join(patch_lines[-5:])}")
-    
-    # TOREVIEW (Jeffrey): Get Modal evaluation URL from config
-    modal_evaluation_base_url = data_dict.get("modal_evaluation_url", "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run")
-    modal_submit_url = f"{modal_evaluation_base_url}/submit"
-    
-    try:
-        # Call Modal evaluation endpoint for SWE-bench instances
-        async with httpx.AsyncClient(timeout=600) as client:  # Increased timeout for evaluation
-            reward_response = await client.post(
-                modal_submit_url,
-                json={
-                    "instance_id": data_dict.get("instance_id"),
-                    "patch": solution_patch,
-                    "dataset_name": data_dict.get("dataset_name", "princeton-nlp/SWE-bench_Verified"),
-                    "split": data_dict.get("split", "test"),
-                    # Run ID can be passed for tracking
-                    "run_id": data_dict.get("run_id", f"verl_eval_{data_dict.get('instance_id', 'unknown')}")
-                }
-            )
-            
-            if reward_response.status_code == 200:
-                reward_data = reward_response.json()
-                
-                # Check if evaluation was successful
-                if not reward_data.get("success", False):
-                    logger.error(f"Evaluation failed: {reward_data.get('error', 'Unknown error')}")
-                    return 0.0
-                
-                # Extract evaluation results
-                resolved = reward_data.get("resolved", False)
-                test_results = reward_data.get("test_results", {})
-                execution_time = reward_data.get("execution_time", 0)
-                
-                # Log evaluation details
-                logger.info(f"Evaluation completed in {execution_time:.2f}s")
-                logger.info(f"Instance resolved: {resolved}")
-                logger.info(f"Test results: {test_results}")
-                
-                # Convert resolution status to score
-                # TODO (Shankha): Consider more nuanced scoring based on test results
-                # For now: resolved = 1.0, not resolved = 0.0
-                score = 1.0 if resolved else 0.0
-                
-                # Optional: Partial credit based on test results
-                if not resolved and test_results:
-                    # Count passed tests for partial credit
-                    total_tests = len(test_results)
-                    passed_tests = sum(1 for result in test_results.values() if result == "PASSED")
-                    if total_tests > 0:
-                        partial_score = passed_tests / total_tests * 0.5  # Max 0.5 for partial success
-                        score = max(score, partial_score)
-                        logger.info(f"Partial credit: {passed_tests}/{total_tests} tests passed = {partial_score}")
-                
-                return score
-            else:
-                logger.error(f"Evaluation request failed with status {reward_response.status_code}")
-                logger.error(f"Response: {reward_response.text}")
-                return 0.0
-                
-    except httpx.TimeoutException:
-        logger.error("Evaluation timed out after 600 seconds")
-        # TODO (Shankha): Implement retry logic or fallback scoring
-        # Evaluation can take several minutes for complex patches
-        return 0.0
-    except Exception as e:
-        logger.error(f"Error during evaluation: {e}")
-        # TODO (Shankha): Decide if we should raise or return default score
-        return 0.0
+    # Return default score since evaluation happens in the agent loop
+    return 0.0
 
 
 # Optional: Custom reward model for more sophisticated scoring

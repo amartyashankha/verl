@@ -87,6 +87,12 @@ n_resp_per_prompt=2  # Reduce for 14B model (4 default)
 n_resp_per_prompt_val=2  # Reduce for 14B model (8 default)
 val_batch_size=16  # Process validation in batches to avoid overwhelming Modal API
 
+# train_batch_size=2  # Reduce for 14B model (32 default)
+# ppo_mini_batch_size=1  # Reduce for 14B model (8 default)
+# n_resp_per_prompt=1  # Reduce for 14B model (4 default)
+# n_resp_per_prompt_val=1  # Reduce for 14B model (8 default)
+# val_batch_size=2  # Process validation in batches to avoid overwhelming Modal API
+
 # Debug mode settings (set DEBUG_MODE=true to enable)
 if [[ "${DEBUG_MODE:-false}" == "true" ]]; then
     echo "DEBUG MODE: Using faster settings for development"

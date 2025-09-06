@@ -280,29 +280,45 @@ class RewardManagerWorker:
         # The solution patch from the agent loop needs to be passed through
         non_tensor_batch = {
             "__num_turns__": np.array([output.num_turns]),
-            # Add reward_model structure expected by the reward manager
-            "reward_model": kwargs.get("reward_model", {"ground_truth": None}),
-            "data_source": kwargs.get("data_source", "unknown"),
+            # Add reward_model structure expected by the reward manager - wrap dict in array for DataProto
+            "reward_model": np.array([kwargs.get("reward_model", {"ground_truth": None})], dtype=object),
+            "data_source": np.array([kwargs.get("data_source", "unknown")]),
             # CRITICAL: Pass the solution patch through extra_info -> metrics
-            # This is what compute_score in orchestrator.py expects to send to the eval endpoint
-            "extra_info": {
-                "metrics": output.metrics if output.metrics else {},
+            # This extra_info will be passed to compute_score function
+            # Must be a numpy array of dicts for DataProto compatibility
+            "extra_info": np.array([{
+                # Store basic metadata for logging/debugging
+                "metrics": output.metrics.model_dump() if output.metrics else {},
                 "num_turns": output.num_turns,
+                "instance_id": kwargs.get("instance_id", "unknown"),
+                "dataset_name": kwargs.get("dataset_name", "SWE-Gym/SWE-Gym"),
+                "split": kwargs.get("split", "train"),
+                "run_id": kwargs.get("run_id", "unknown"),
                 **kwargs.get("extra_info", {})
-            },
-            # Pass through dataset info needed for Modal evaluation endpoint
-            "instance_id": kwargs.get("instance_id", "unknown"),
-            "dataset_name": kwargs.get("dataset_name", "princeton-nlp/SWE-bench_Verified"), 
-            "split": kwargs.get("split", "test"),
-            "modal_evaluation_url": kwargs.get("modal_evaluation_url",
-                                              "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"),
-            "run_id": kwargs.get("run_id", f"verl_eval_{kwargs.get('instance_id', 'unknown')}"),
-            # Keep other kwargs, properly structured
-            **{k: np.array([v]) if not isinstance(v, (dict, list)) else v
-               for k, v in kwargs.items()
-               if k not in ["reward_model", "data_source", "extra_info", "__num_turns__",
-                           "instance_id", "dataset_name", "split", "modal_evaluation_url", "run_id"]},
+            }], dtype=object),
+            # Pass through dataset info needed for other parts of the pipeline - convert to arrays
+            "instance_id": np.array([kwargs.get("instance_id", "unknown")]),
+            "dataset_name": np.array([kwargs.get("dataset_name", "SWE-Gym/SWE-Gym")]), 
+            "split": np.array([kwargs.get("split", "train")]),
+            "run_id": np.array([kwargs.get("run_id", f"verl_eval_{kwargs.get('instance_id', 'unknown')}")]),
         }
+        # Ensure all non_tensor_batch values are numpy arrays
+        # This is a safety check to prevent DataProto assertion errors
+        for key, val in non_tensor_batch.items():
+            if not isinstance(val, np.ndarray):
+                # Log the issue for debugging
+                print(f"WARNING: Converting non_tensor_batch['{key}'] to numpy array (was {type(val).__name__})")
+                # Convert to numpy array
+                if key == "reward_model" and isinstance(val, dict):
+                    # Special handling for reward_model dict
+                    non_tensor_batch[key] = np.array([val], dtype=object)
+                elif hasattr(val, '__len__') and not isinstance(val, (str, dict)):
+                    # For list-like objects
+                    non_tensor_batch[key] = np.array(val, dtype=object)
+                else:
+                    # For single values or dicts
+                    non_tensor_batch[key] = np.array([val], dtype=object)
+        
         data = DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,

@@ -17,7 +17,9 @@ import json
 import logging
 import os
 import re  # Added for code block extraction
+import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -37,6 +39,93 @@ from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def build_full_prompt_for_first_cell(task_prompt: str) -> tuple[str, str]:
+    """Build the full prompt exactly like run_leader_agent_swebench.py.
+    Returns (full_prompt_for_starting_txt, first_cell_source_code).
+    """
+    # 1) Load tool_definitions.json from the same location as SWE-bench runner
+    def _load_tool_definitions() -> list[dict]:
+        # Try multiple locations for tool_definitions.json
+        candidates = [
+            Path(__file__).parent / "tool_definitions.json",
+            Path(__file__).parent.parent.parent.parent.parent / "hierarchial_ppo_shankha" / "inference" / "tool_definitions.json",
+            Path("/home/jeffreyliu/fine-tuning-infra/hierarchial_ppo_shankha/inference/tool_definitions.json"),
+            Path("/home/tianhangzhu/RL/jeffery/hierarchial_ppo_shankha/inference/tool_definitions.json"),
+        ]
+        
+        for p in candidates:
+            try:
+                if p.exists():
+                    with open(p, 'r') as f:
+                        return json.load(f)
+            except Exception:
+                pass
+        
+        # Return empty list if not found (matching run_leader_agent_swebench.py behavior)
+        logger.warning("tool_definitions.json not found, using empty list")
+        return []
+
+    def _convert_js_to_python(obj):
+        """Recursively convert JavaScript-style values to Python equivalents"""
+        if isinstance(obj, dict):
+            return {key: _convert_js_to_python(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [_convert_js_to_python(item) for item in obj]
+        else:
+            # Handle boolean values - check both actual booleans and string representations
+            if obj is True:
+                return True
+            elif obj is False:
+                return False
+            elif obj is None:
+                return None
+            elif isinstance(obj, str):
+                obj_lower = obj.lower().strip()
+                if obj_lower == "false":
+                    return False
+                elif obj_lower == "true":
+                    return True
+                elif obj_lower == "null":
+                    return None
+            return obj
+
+    def _json_dumps_python_style(obj):
+        """JSON dumps that preserves Python boolean format"""
+        json_str = json.dumps(obj, indent=2)
+        # Replace JSON booleans with Python booleans
+        json_str = json_str.replace('"true"', 'True')
+        json_str = json_str.replace('"false"', 'False')
+        json_str = json_str.replace('"null"', 'None')
+        json_str = json_str.replace('true', 'True')
+        json_str = json_str.replace('false', 'False')
+        json_str = json_str.replace('null', 'None')
+        return json_str
+
+    # Convert tool definitions
+    tool_defs = _convert_js_to_python(_load_tool_definitions())
+    tool_def_str = _json_dumps_python_style(tool_defs)
+
+    # Double-JSON-dump for problem_statement (exactly as in run_leader_agent_swebench.py)
+    escaped_problem_statement = json.dumps(json.dumps(task_prompt))
+
+    # Create first cell source using triple-quoted f-string format (identical to run_leader_agent_swebench.py)
+    first_cell_source = f'''# Problem Statement and Configuration
+problem_statement = {escaped_problem_statement}
+
+work_dir = "/testbed"
+
+# Tool Definitions
+tool_definitions = {tool_def_str}'''
+
+    # Wrap the code in <code> tags
+    wrapped_code = f"<code>{first_cell_source}</code>"
+    
+    # Return the prompt in the expected format
+    full_prompt = f"<thinking>Please solve a PR request</thinking>{wrapped_code}"
+    
+    return full_prompt, first_cell_source
 
 
 @register("orchestrator_coding_agent")
@@ -184,8 +273,12 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        # Sandbox handles full prompt generation; default to empty if not provided
-        messages = list(kwargs.get("raw_prompt", [{"role": "user", "content": ""}]))
+        # Build proper prompt with first cell code
+        task_prompt = kwargs.get("task_prompt", "")
+        full_prompt, first_cell_code = build_full_prompt_for_first_cell(task_prompt)
+        
+        # Use the properly formatted prompt
+        messages = [{"role": "user", "content": full_prompt}]
         image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
         metrics = {}
         request_id = uuid4().hex
@@ -199,19 +292,21 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         worker_id = kwargs.get("worker_id", 0)
         # IMPORTANT: Make run_id unique per worker to avoid sandbox collisions
         # Multiple workers may process the same instance simultaneously (especially during validation)
-        # We use a simple format: run_w{worker_id}_{request_id[:8]}
+        # We use a combination of worker_id, full request_id, and timestamp for uniqueness
         # The Modal endpoint will combine this with instance_id to create the final sandbox key
-        run_id = f"run_w{worker_id}_{request_id[:8]}"
+        import time
+        timestamp_ms = int(time.time() * 1000) % 1000000  # Last 6 digits of millisecond timestamp
+        run_id = f"run_w{worker_id}_{request_id}_{timestamp_ms}"
         notebook_id = kwargs.get("notebook_id", "main")
         logger.info(f"Worker {worker_id} processing {instance_id} with run_id: {run_id}")
         task_prompt = kwargs.get("task_prompt", None)
         dataset_name = kwargs.get("dataset_name", "SWE-Gym/SWE-Gym")
         split = kwargs.get("split", ("train" if "swe-gym" in dataset_name.lower() else "test"))
         
-        # TOREVIEW (Jeffrey): task_prompt now comes from the dataset
-        # No need to load the dataset again here
+        # task_prompt is used to build the full prompt above
+        # Log if it's missing
         if not task_prompt:
-            logger.warning(f"No task_prompt provided for {instance_id}. Modal sandbox will start without initial problem statement.")
+            logger.warning(f"No task_prompt provided for {instance_id}. Using empty problem statement.")
         
         # TOREVIEW (Shankha): Check if httpx is available
         if httpx is None:
@@ -220,7 +315,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         # TOREVIEW (Shankha): Initialize HTTP client and sandbox
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
             # TOREVIEW (Shankha): Initialize the sandbox for this agent
-            endpoint_url = self._endpoint("init-sandbox")
+            endpoint_url = self._endpoint("init-sandbox") # 
             logger.info(f"Calling Modal endpoint: {endpoint_url}")
             
             try:
@@ -234,8 +329,9 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                         "model_endpoint": "verl",  # TODO: Get from config if needed
                         "truncation_strategy": self.truncation_strategy or "ast_llm_compaction",
                         "max_tokens": self.truncation_max_tokens,
-                        # Pass task_prompt to trigger first-cell creation and prompt file write
-                        **({"task_prompt": task_prompt} if task_prompt else {})
+                        # Pass full_prompt and first_cell_code to trigger first-cell creation
+                        "full_prompt": full_prompt,
+                        "first_cell_code": first_cell_code
                     }
                 )
                 
@@ -319,6 +415,36 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         user_turns, assistant_turns = 0, 0
         # TOREVIEW (Shankha): Re-open the client for the main loop
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
+            # CRITICAL: Execute the first cell to set up the environment
+            # This sets up problem_statement, work_dir, and tool_definitions in the sandbox
+            if first_cell_code:
+                logger.info(f"Executing initial setup cell for {instance_id}")
+                try:
+                    exec_response = await client.post(
+                        self._endpoint("execute-cell"),
+                        json={
+                            "instance_id": instance_id,
+                            "run_id": run_id,
+                            "notebook_id": notebook_id,
+                            "cell_content": first_cell_code
+                        }
+                    )
+                    
+                    if exec_response.status_code == 200:
+                        exec_data = exec_response.json()
+                        if exec_data.get("success"):
+                            logger.info(f"Successfully executed initial setup cell")
+                            if exec_data.get("stdout"):
+                                logger.debug(f"Setup output: {exec_data['stdout'][:500]}")
+                        else:
+                            logger.error(f"Failed to execute setup cell: {exec_data.get('error')}")
+                    else:
+                        logger.error(f"Setup cell execution returned status {exec_response.status_code}")
+                        
+                except Exception as e:
+                    logger.error(f"Error executing initial setup cell: {e}")
+                    # Continue anyway - the model might still work without proper setup
+            
             while True:
                 # TOREVIEW (Shankha): Apply truncation before generation if enabled
                 # This ensures we don't exceed context limits during training
@@ -367,8 +493,17 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     # TOREVIEW (Shankha): CRITICAL - Response mask needs to be rebuilt after truncation
                     # TODO (Shankha): This is complex - we need to track which parts of the truncated
                     # conversation correspond to assistant vs tool responses
-                    # For now, we'll have to regenerate from this point
+                    # 
+                    # Future improvement: Instead of resetting, we could:
+                    # 1. Track the mapping between original and truncated messages
+                    # 2. Preserve response_mask segments that correspond to retained messages
+                    # 3. Only regenerate log_probs for the compacted/summarized portions
+                    # This would allow PPO to still learn from the preserved assistant responses
+                    # 
+                    # Current approach: Reset and regenerate from this point
+                    # This means PPO will only optimize responses generated after truncation
                     logger.warning("Truncation applied - response mask and log probs will be regenerated from this point")
+                    logger.warning("Note: Previous assistant responses before truncation are not used for PPO training")
                     response_mask = []
                     response_logprobs = []
                     
@@ -656,11 +791,161 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 logger.error(f"Error terminating sandbox: {e}")
                 # Non-critical error - sandbox will eventually timeout
         
-        # TOREVIEW (Shankha): Include solution patch in metrics for reward computation
-        # TODO (Shankha): Consider if this is the best way to pass the solution
-        # Alternative: Add to non_tensor_batch in DataProto later in the pipeline
-        metrics["solution_patch"] = solution_patch
-        metrics["solution_metadata"] = solution_metadata
+        # TOREVIEW (Jeffrey): Evaluate solution patch directly here
+        # This is much simpler than passing it through the entire pipeline
+        reward_score = 0.0
+        if solution_patch:
+            try:
+                # Hardcode the Modal evaluation URL for now to avoid config issues
+                modal_evaluation_url = "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"
+                modal_submit_url = f"{modal_evaluation_url}/submit"
+                logger.info(f"Submitting evaluation to: {modal_submit_url}")
+                
+                # Debug: Log what we're submitting
+                logger.info(f"  Instance: {instance_id}")
+                logger.info(f"  Patch size: {len(solution_patch)} chars, {len(solution_patch.splitlines())} lines")
+                logger.info(f"  Run ID: {run_id}")
+                
+                # Check if patch looks valid
+                if not solution_patch.strip():
+                    logger.error(f"ERROR: Empty patch being submitted for {instance_id}!")
+                elif not solution_patch.startswith("diff"):
+                    logger.warning(f"WARNING: Patch doesn't start with 'diff' for {instance_id}")
+                    logger.warning(f"  First 100 chars: {solution_patch[:100]}")
+                
+                # Submit evaluation and get call_id
+                async with httpx.AsyncClient(timeout=30) as eval_client:
+                    eval_response = await eval_client.post(
+                        modal_submit_url,
+                        json={
+                            "instance_id": instance_id,
+                            "patch": solution_patch,
+                            "run_id": run_id
+                        }
+                    )
+                    
+                    if eval_response.status_code == 200:
+                        submit_data = eval_response.json()
+                        call_id = submit_data.get("call_id")
+                        
+                        if not call_id:
+                            logger.error(f"No call_id returned for {instance_id}")
+                            reward_score = 0.0
+                        else:
+                            logger.info(f"Submitted {instance_id} for evaluation, call_id: {call_id}")
+                            
+                            # Poll for results
+                            result_url = f"{modal_evaluation_url}/result/{call_id}"
+                            max_poll_time = 300  # 5 minutes max
+                            poll_interval = 3.0
+                            start_time = time.time()
+                            
+                            while time.time() - start_time < max_poll_time:
+                                async with httpx.AsyncClient(timeout=30) as poll_client:
+                                    poll_response = await poll_client.get(result_url)
+                                    
+                                    if poll_response.status_code == 200:
+                                        # Got result
+                                        result_data = poll_response.json()
+                                        
+                                        if result_data.get("success", False):
+                                            # Check if resolved
+                                            resolved = result_data.get("resolved", False)
+                                            test_results = result_data.get("test_results", {})
+                                            
+                                            # Calculate score based on test results
+                                            if resolved:
+                                                reward_score = 1.0
+                                            elif test_results:
+                                                # Only care about FAIL_TO_PASS tests
+                                                tests_status = test_results.get("tests_status", {})
+                                                if tests_status:
+                                                    fail_to_pass = tests_status.get("FAIL_TO_PASS", {})
+                                                    
+                                                    # Count successes and failures for FAIL_TO_PASS
+                                                    fail_to_pass_success = len(fail_to_pass.get("success", []))
+                                                    fail_to_pass_failure = len(fail_to_pass.get("failure", []))
+                                                    total_fail_to_pass = fail_to_pass_success + fail_to_pass_failure
+                                                    
+                                                    # Reward = fraction of failing tests that now pass
+                                                    if total_fail_to_pass > 0:
+                                                        reward_score = fail_to_pass_success / total_fail_to_pass
+                                                    else:
+                                                        # No FAIL_TO_PASS tests exist (shouldn't happen in SWE-bench)
+                                                        reward_score = 0.0
+                                                else:
+                                                    # No test status information
+                                                    reward_score = 0.0
+                                            else:
+                                                # No test results at all
+                                                reward_score = 0.0
+                                            
+                                            # Enhanced debugging for evaluation results
+                                            logger.info(f"Evaluation for {instance_id}: resolved={resolved}, score={reward_score}")
+                                            if not resolved and test_results:
+                                                # Log detailed test results to understand why it's not resolved
+                                                tests_status = test_results.get("tests_status", {})
+                                                if tests_status:
+                                                    fail_to_pass = tests_status.get("FAIL_TO_PASS", {})
+                                                    pass_to_pass = tests_status.get("PASS_TO_PASS", {})
+                                                    fail_to_fail = tests_status.get("FAIL_TO_FAIL", {})
+                                                    pass_to_fail = tests_status.get("PASS_TO_FAIL", {})
+                                                    
+                                                    logger.info(f"  Test breakdown for {instance_id}:")
+                                                    logger.info(f"    FAIL_TO_PASS: {len(fail_to_pass.get('success', []))} success, {len(fail_to_pass.get('failure', []))} failure")
+                                                    logger.info(f"    PASS_TO_PASS: {len(pass_to_pass.get('success', []))} success, {len(pass_to_pass.get('failure', []))} failure")
+                                                    logger.info(f"    FAIL_TO_FAIL: {len(fail_to_fail.get('success', []))} success, {len(fail_to_fail.get('failure', []))} failure")
+                                                    logger.info(f"    PASS_TO_FAIL: {len(pass_to_fail.get('success', []))} success, {len(pass_to_fail.get('failure', []))} failure")
+                                                    
+                                                    # Log any error messages
+                                                    if result_data.get("error_msg"):
+                                                        logger.warning(f"  Error message: {result_data['error_msg']}")
+                                            elif not resolved and not test_results:
+                                                logger.warning(f"  No test results returned for {instance_id}")
+                                                if result_data.get("error_msg"):
+                                                    logger.error(f"  Error: {result_data['error_msg']}")
+                                            
+                                            logger.info(f"Evaluation for {instance_id}: resolved={resolved}, score={reward_score}")
+                                        else:
+                                            logger.error(f"Evaluation failed: {result_data.get('error', 'Unknown error')}")
+                                            reward_score = 0.0
+                                        break  # Got result, exit poll loop
+                                        
+                                    elif poll_response.status_code == 202:
+                                        # Still processing, continue polling
+                                        await asyncio.sleep(poll_interval)
+                                        
+                                    elif poll_response.status_code == 404:
+                                        logger.error(f"Result not found or expired for {instance_id}")
+                                        reward_score = 0.0
+                                        break
+                                        
+                                    else:
+                                        logger.error(f"Unexpected poll status {poll_response.status_code} for {instance_id}")
+                                        reward_score = 0.0
+                                        break
+                            else:
+                                # Timeout
+                                logger.error(f"Evaluation timeout for {instance_id} after {max_poll_time}s")
+                                reward_score = 0.0
+                    else:
+                        logger.error(f"Failed to submit evaluation: status {eval_response.status_code}")
+                        reward_score = 0.0
+                        
+            except httpx.InvalidURL as e:
+                logger.error(f"Invalid URL error: {e}")
+                logger.error(f"Modal URL was: {modal_evaluation_url}")
+                logger.error(f"Submit URL was: {modal_submit_url}")
+                # Continue with 0 reward on evaluation failure
+            except httpx.TimeoutException as e:
+                logger.error(f"Evaluation timeout after 600 seconds: {e}")
+                # Continue with 0 reward on evaluation failure
+            except Exception as e:
+                logger.error(f"Error during evaluation: {e}")
+                logger.error(f"Error type: {type(e).__name__}")
+                # Continue with 0 reward on evaluation failure
+        else:
+            logger.warning(f"No solution patch for {instance_id}, using reward=0.0")
         
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -670,6 +955,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             num_turns=user_turns + assistant_turns + 1,
             metrics=metrics,
+            reward_score=reward_score,  # Set the reward directly
         )
         return output
 

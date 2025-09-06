@@ -1120,6 +1120,11 @@ class RayPPOTrainer:
                     else:
                         print("🚀 TRAINING BEGINS - No CUDA available")
                 
+                # Debug: Log start of each PPO step
+                print(f"\n{'='*80}")
+                print(f"🔄 PPO Step {self.global_steps} | Epoch {epoch + 1}/{self.config.trainer.total_epochs}")
+                print(f"{'='*80}")
+                
                 metrics = {}
                 timing_raw = {}
 
@@ -1148,12 +1153,14 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        print(f"  📝 Generating sequences (batch size: {len(gen_batch.batch)}, n_responses: {self.config.actor_rollout_ref.rollout.n})...")
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        print(f"  ✅ Generation complete (took {timing_raw.get('gen', 0):.2f}s)")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1194,6 +1201,7 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        print(f"  🎯 Computing rewards...")
                         # compute reward model score
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
@@ -1203,9 +1211,11 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                        print(f"  ✅ Rewards computed")
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        print(f"  📊 Computing old log probabilities...")
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
@@ -1234,10 +1244,13 @@ class RayPPOTrainer:
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
+                            print(f"  💰 Computing critic values...")
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                            print(f"  ✅ Values computed")
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        print(f"  📈 Computing advantages...")
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
@@ -1275,18 +1288,24 @@ class RayPPOTrainer:
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
+                            print(f"  🧠 Updating critic...")
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+                        print(f"  ✅ Critic updated (loss: {critic_output_metrics.get('critic/loss', 'N/A'):.4f})")
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            print(f"  🎭 Updating actor (PPO optimization)...")
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        print(f"  ✅ Actor updated (policy loss: {actor_output_metrics.get('actor/policy_loss', 'N/A'):.4f}, KL: {actor_output_metrics.get('actor/kl', 'N/A'):.4f})")
+                    else:
+                        print(f"  ⏳ Skipping actor update (critic warmup: step {self.global_steps}/{self.config.trainer.critic_warmup})")
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1384,6 +1403,16 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                
+                # Debug: Print key metrics summary
+                print(f"\n  📊 Step {self.global_steps} Summary:")
+                print(f"     - Total reward: {metrics.get('data/reward', 'N/A'):.3f}")
+                print(f"     - Advantage mean: {metrics.get('data/advantages_mean', 'N/A'):.3f}")
+                print(f"     - KL divergence: {metrics.get('actor/kl', 'N/A'):.4f}")
+                print(f"     - Policy loss: {metrics.get('actor/policy_loss', 'N/A'):.4f}")
+                print(f"     - Value loss: {metrics.get('critic/loss', 'N/A'):.4f}")
+                print(f"     - Step time: {timing_raw.get('step', 0):.2f}s")
+                print(f"{'='*80}\n")
 
                 progress_bar.update(1)
                 self.global_steps += 1
