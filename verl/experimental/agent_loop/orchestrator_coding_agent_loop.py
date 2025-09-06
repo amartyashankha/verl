@@ -278,6 +278,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         cls.oracle_messages = None
         cls.oracle_assistant_index = 0
         cls.oracle_user_index = 0
+        cls._last_loaded_oracle_file = None  # Track the loaded oracle file path for finding solution.patch
         
         print(f"Initialized Modal agent with base URL: {cls.modal_base_url}")
         if cls.use_oracle_generation:
@@ -499,6 +500,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 self.oracle_assistant_index = 0
                 self.oracle_user_index = 0
                 self._loaded_oracle_instance_id = instance_id
+                self._last_loaded_oracle_file = selected_file  # Store the path for finding solution.patch
                 
                 # Log detailed breakdown
                 assistant_msgs = [msg for msg in self.oracle_messages if msg.get("role") == "assistant"]
@@ -747,8 +749,56 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         return content
 
     def _extract_solution_from_oracle_messages(self):
-        """Extract the solution patch from oracle messages"""
-        logger.info(f"🔍 Extracting solution from {len(self.oracle_messages) if self.oracle_messages else 0} oracle messages")
+        """Extract the solution patch from solution.patch file in the oracle directory"""
+        logger.info(f"🔍 Looking for solution.patch file for instance: {getattr(self, '_loaded_oracle_instance_id', 'unknown')}")
+        
+        # First, try to find solution.patch file based on the oracle directory structure
+        if hasattr(self, '_loaded_oracle_instance_id') and self._loaded_oracle_instance_id:
+            instance_id = self._loaded_oracle_instance_id
+            
+            # Try different possible locations for solution.patch
+            possible_paths = []
+            
+            # If we have oracle_messages_dir, look for solution.patch there
+            if hasattr(self, 'oracle_messages_dir') and self.oracle_messages_dir:
+                base_dir = self.oracle_messages_dir
+                
+                # Pattern 1: {base_dir}/noninteractive_results_swe_gym_train_rest/{instance_id}/solution.patch
+                path1 = os.path.join(base_dir, "noninteractive_results_swe_gym_train_rest", instance_id, "solution.patch")
+                possible_paths.append(path1)
+                
+                # Pattern 2: {base_dir}/{instance_id}/solution.patch
+                path2 = os.path.join(base_dir, instance_id, "solution.patch")
+                possible_paths.append(path2)
+                
+                # Pattern 3: Same directory as the oracle messages file
+                if hasattr(self, '_last_loaded_oracle_file') and self._last_loaded_oracle_file:
+                    oracle_dir = os.path.dirname(self._last_loaded_oracle_file)
+                    # Go up one level from ipynbs_subleader to instance directory
+                    if "ipynbs_subleader" in oracle_dir:
+                        instance_dir = os.path.dirname(oracle_dir)
+                        path3 = os.path.join(instance_dir, "solution.patch")
+                        possible_paths.append(path3)
+            
+            # Try each possible path
+            for patch_path in possible_paths:
+                logger.info(f"   Checking for solution.patch at: {patch_path}")
+                if os.path.exists(patch_path):
+                    try:
+                        with open(patch_path, 'r', encoding='utf-8') as f:
+                            patch_content = f.read()
+                        logger.info(f"✅ Found solution.patch file: {patch_path}")
+                        logger.info(f"   Patch size: {len(patch_content)} characters")
+                        logger.info(f"   Patch preview: {patch_content[:200]}...")
+                        return patch_content
+                    except Exception as e:
+                        logger.error(f"❌ Error reading solution.patch from {patch_path}: {e}")
+            
+            logger.warning(f"⚠️ No solution.patch file found for instance {instance_id}")
+            logger.warning(f"   Searched paths: {possible_paths}")
+        
+        # Fallback: Try to extract from oracle messages (original logic)
+        logger.info("📝 Falling back to extracting solution from oracle messages...")
         
         if not self.oracle_messages:
             logger.error("❌ No oracle messages loaded!")
@@ -760,17 +810,12 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         logger.info(f"📊 Oracle message breakdown: {len(assistant_msgs)} assistant, {len(user_msgs)} user messages")
         
         # Look for messages that contain solution patches or git diffs
-        # The solution is typically in one of the later assistant messages
         for idx, message in enumerate(self.oracle_messages):
             if message.get("role") == "assistant":
                 content = message.get("content", "")
                 
-                # Log raw content type
-                logger.debug(f"Message {idx}: type={type(content)}, length={len(str(content))}")
-                
                 # Handle structured content
                 if isinstance(content, list):
-                    logger.debug(f"Message {idx}: Structured content with {len(content)} items")
                     text_content = ""
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "text":
@@ -778,57 +823,19 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                         elif isinstance(item, str):
                             text_content += item
                     content = text_content
-                    logger.debug(f"Message {idx}: Extracted text content: {len(content)} chars")
-                
-                # Log content preview for debugging
-                if content:
-                    preview = content[:500] if len(content) > 500 else content
-                    logger.debug(f"Message {idx} preview: {preview}...")
                 
                 # Look for git diff patterns
                 if content and ("diff --git" in content or content.startswith("diff")):
                     logger.info(f"✅ Found solution patch in oracle message {idx}: {len(content)} characters")
-                    logger.info(f"Solution patch preview: {content[:200]}...")
                     return content
                 
-                # Look for other solution indicators
-                if content and ("patch" in content.lower() or "solution" in content.lower()):
-                    # Check if it looks like a code change
-                    if any(keyword in content.lower() for keyword in ["@@", "+++", "---", "index"]):
-                        logger.info(f"✅ Found potential solution in oracle message {idx}: {len(content)} characters")
-                        logger.info(f"Solution preview: {content[:200]}...")
-                        return content
-                
-                # Additional patterns to check
-                if content:
-                    # Check for code blocks or diffs without explicit keywords
-                    if "```diff" in content or "```patch" in content:
-                        logger.info(f"✅ Found code block with diff/patch in message {idx}")
-                        return content
-                    
-                    # Check for unified diff format
-                    if "\n@@" in content and ("\n+" in content or "\n-" in content):
-                        logger.info(f"✅ Found unified diff format in message {idx}")
-                        return content
+                # Check for unified diff format
+                if content and "\n@@" in content and ("\n+" in content or "\n-" in content):
+                    logger.info(f"✅ Found unified diff format in message {idx}")
+                    return content
         
-        # If no solution found, log what we searched through
-        logger.warning("⚠️ No solution patch found in oracle messages")
-        logger.warning(f"Searched through {len(assistant_msgs)} assistant messages")
-        if assistant_msgs:
-            # Log last assistant message as it might contain the solution
-            last_msg = assistant_msgs[-1]
-            last_content = last_msg.get("content", "")
-            if isinstance(last_content, list):
-                text_content = ""
-                for item in last_content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_content += item.get("text", "")
-                    elif isinstance(item, str):
-                        text_content += item
-                last_content = text_content
-            logger.warning(f"Last assistant message ({len(last_content)} chars) preview: {last_content[:300]}...")
-        
-        return "No solution patch found in oracle messages"
+        logger.warning("⚠️ No solution patch found in oracle messages or solution.patch file")
+        return "No solution patch found"
 
     def extract_code_from_response(self, response: str) -> list[str]:
         """Extract code from <code></code> blocks in the response, return list of code blocks"""
@@ -1520,7 +1527,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             return messages
     
     async def _run_oracle_mode(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        """Oracle mode that spins up sandboxes and executes oracle code cells"""
+        """Simplified oracle mode matching run_oracle_task.py flow"""
         logger.info("🔮 ENTERING ORACLE MODE")
         
         # Extract parameters
@@ -1578,232 +1585,51 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             )
         logger.info(f"✅ Prompt tokenized: {len(prompt_ids)} tokens")
         
-        # Now we need to spin up a sandbox and execute oracle code cells
-        logger.info("🏗️ Setting up sandbox for oracle execution...")
-        
-        # Generate unique run_id
-        worker_id = kwargs.get("worker_id", 0)
+        # Generate oracle response (replay assistant message)
+        logger.info("🎭 Generating oracle response (replaying assistant message)...")
         request_id = uuid4().hex
-        timestamp_ms = int(time.time() * 1000) % 1000000
-        run_id = f"oracle_w{worker_id}_{request_id}_{timestamp_ms}"
-        notebook_id = "oracle_main"
-        dataset_name = kwargs.get("dataset_name", "SWE-Gym/SWE-Gym")
+        output = await self._generate_with_oracle(messages, sampling_params, request_id)
+        response_ids = output.token_ids
+        response_logprobs = output.log_probs
         
-        # Initialize sandbox
-        async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
-            logger.info(f"📦 Initializing Modal sandbox for oracle execution...")
-            try:
-                init_response = await client.post(
-                    self._endpoint("init-sandbox"),
-                    json={
-                        "dataset": dataset_name,
-                        "instance_id": instance_id,
-                        "run_id": run_id,
-                        "notebook_id": notebook_id,
-                        "model_endpoint": "oracle",
-                        "truncation_strategy": self.truncation_strategy or "ast_llm_compaction",
-                        "max_tokens": self.truncation_max_tokens,
-                        "full_prompt": full_prompt,
-                        "first_cell_code": first_cell_code
-                    }
-                )
-                
-                if init_response.status_code != 200:
-                    logger.error(f"Failed to initialize sandbox: status {init_response.status_code}")
-                    return AgentLoopOutput(
-                        prompt_ids=prompt_ids,
-                        response_ids=[],
-                        response_mask=[],
-                        multi_modal_data={},
-                        response_logprobs=None,
-                        num_turns=0,
-                        metrics={"error": f"Sandbox init failed: {init_response.status_code}"},
-                    )
-                
-                init_data = init_response.json()
-                if not (init_data.get("success") or init_data.get("status") == "exists"):
-                    logger.error(f"Sandbox initialization failed: {init_data}")
-                    return AgentLoopOutput(
-                        prompt_ids=prompt_ids,
-                        response_ids=[],
-                        response_mask=[],
-                        multi_modal_data={},
-                        response_logprobs=None,
-                        num_turns=0,
-                        metrics={"error": "Sandbox init failed"},
-                    )
-                
-                sandbox_id = init_data.get("sandbox_id")
-                logger.info(f"✅ Sandbox initialized: {sandbox_id}")
-                
-            except Exception as e:
-                logger.error(f"Error initializing sandbox: {e}")
-                return AgentLoopOutput(
-                    prompt_ids=prompt_ids,
-                    response_ids=[],
-                    response_mask=[],
-                    multi_modal_data={},
-                    response_logprobs=None,
-                    num_turns=0,
-                    metrics={"error": f"Sandbox init error: {e}"},
-                )
-        
-        # Execute oracle code cells in the sandbox
-        logger.info("🔧 Executing oracle code cells in sandbox...")
-        
-        # Collect all assistant messages and execute their code
-        all_response_text = ""
-        all_response_ids = []
-        all_log_probs = []
-        
-        assistant_messages = [msg for msg in self.oracle_messages if msg.get("role") == "assistant"]
-        logger.info(f"📝 Found {len(assistant_messages)} assistant messages to execute")
-        
-        async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
-            # Execute the first cell setup
-            if first_cell_code:
-                logger.info("Executing initial setup cell...")
-                try:
-                    exec_response = await client.post(
-                        self._endpoint("execute-cell"),
-                        json={
-                            "instance_id": instance_id,
-                            "run_id": run_id,
-                            "notebook_id": notebook_id,
-                            "cell_content": first_cell_code
-                        }
-                    )
-                    if exec_response.status_code == 200:
-                        exec_data = exec_response.json()
-                        if exec_data.get("success"):
-                            logger.info("✅ Setup cell executed successfully")
-                        else:
-                            logger.warning(f"Setup cell failed: {exec_data.get('error')}")
-                except Exception as e:
-                    logger.error(f"Error executing setup cell: {e}")
-            
-            # Execute each assistant message's code
-            for i, oracle_msg in enumerate(assistant_messages[:10]):  # Limit to first 10 for safety
-                logger.info(f"Processing oracle assistant message {i+1}/{min(10, len(assistant_messages))}")
-                
-                # Extract content
-                content = oracle_msg.get("content", "")
-                if isinstance(content, list):
-                    text_content = ""
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            text_content += item.get("text", "")
-                        elif isinstance(item, str):
-                            text_content += item
-                    content = text_content
-                
-                # Accumulate response text for tokenization
-                all_response_text += content + "\n"
-                
-                # Extract and execute code blocks
-                code_blocks = self.extract_code_from_response(content)
-                if code_blocks:
-                    logger.info(f"  Found {len(code_blocks)} code blocks in message {i+1}")
-                    for j, code_block in enumerate(code_blocks):
-                        logger.debug(f"  Executing code block {j+1}/{len(code_blocks)}...")
-                        try:
-                            exec_response = await client.post(
-                                self._endpoint("execute-cell"),
-                                json={
-                                    "instance_id": instance_id,
-                                    "run_id": run_id,
-                                    "notebook_id": notebook_id,
-                                    "cell_content": code_block.strip()
-                                }
-                            )
-                            if exec_response.status_code == 200:
-                                exec_data = exec_response.json()
-                                if exec_data.get("success"):
-                                    logger.debug(f"    ✅ Code block {j+1} executed")
-                                    if exec_data.get("stdout"):
-                                        logger.debug(f"    Output: {exec_data['stdout'][:100]}...")
-                                else:
-                                    logger.warning(f"    ⚠️ Code block {j+1} failed: {exec_data.get('error', '')}")
-                                    if exec_data.get("stderr"):
-                                        logger.debug(f"    Stderr: {exec_data['stderr'][:100]}...")
-                        except Exception as e:
-                            logger.error(f"    ❌ Error executing code block {j+1}: {e}")
-                else:
-                    logger.debug(f"  No code blocks in message {i+1}")
-            
-            # Get solution patch from sandbox
-            logger.info("🔍 Extracting solution patch from sandbox...")
-            solution_patch = ""
-            try:
-                solution_response = await client.post(
-                    self._endpoint("get-solution-patch"),
-                    json={
-                        "instance_id": instance_id,
-                        "run_id": run_id,
-                        "notebook_id": notebook_id
-                    }
-                )
-                
-                if solution_response.status_code == 200:
-                    solution_data = solution_response.json()
-                    if solution_data.get("success"):
-                        solution_patch = solution_data.get("patch", "")
-                        logger.info(f"✅ Solution patch extracted: {len(solution_patch)} chars")
-                        if solution_patch:
-                            logger.info(f"   Patch preview: {solution_patch[:200]}...")
-                    else:
-                        logger.warning(f"Failed to get solution: {solution_data}")
-                else:
-                    logger.error(f"Solution extraction failed with status {solution_response.status_code}")
-            except Exception as e:
-                logger.error(f"Error extracting solution: {e}")
-            
-            # Terminate sandbox
-            try:
-                terminate_response = await client.post(
-                    self._endpoint("terminate-sandbox"),
-                    json={
-                        "instance_id": instance_id,
-                        "run_id": run_id,
-                        "notebook_id": notebook_id
-                    }
-                )
-                if terminate_response.status_code == 200:
-                    logger.info("✅ Sandbox terminated")
-            except Exception as e:
-                logger.error(f"Error terminating sandbox: {e}")
-        
-        # Tokenize the accumulated response text
-        logger.info("🔤 Tokenizing oracle execution results...")
-        response_ids = self.tokenizer.encode(all_response_text, add_special_tokens=False) if all_response_text else []
-        response_logprobs = [0.5] * len(response_ids) if response_ids else None
-        
-        logger.info(f"✅ Oracle execution complete:")
+        logger.info(f"✅ Oracle response generated:")
         logger.info(f"   Response tokens: {len(response_ids)}")
-        logger.info(f"   Solution patch: {len(solution_patch) if solution_patch else 0} chars")
+        logger.info(f"   Has log probs: {response_logprobs is not None}")
+        if response_logprobs:
+            logger.info(f"   Log probs length: {len(response_logprobs)}")
+            logger.info(f"   Sample log probs: {response_logprobs[:5] if len(response_logprobs) > 5 else response_logprobs}")
+        
+        # Decode response to see what was generated
+        if response_ids:
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            logger.info(f"   Response text ({len(response_text)} chars): {response_text[:200]}...")
         
         # Build response mask
         response_mask = [1] * len(response_ids)
+        logger.info(f"✅ Response mask built: {len(response_mask)} elements")
         
-        # Build metrics with the actual solution patch from sandbox
+        # Extract solution patch from oracle messages
+        logger.info("🔍 Extracting solution patch from oracle messages...")
+        solution_patch = self._extract_solution_from_oracle_messages()
+        
+        # Log solution patch status
+        if solution_patch and solution_patch != "No solution patch found in oracle messages" and solution_patch != "No oracle messages loaded":
+            logger.info(f"✅ Solution patch extracted: {len(solution_patch)} chars")
+            logger.info(f"   Solution preview: {solution_patch[:200]}...")
+        else:
+            logger.warning(f"⚠️ No valid solution patch found: {solution_patch}")
+        
+        # Build metrics
         metrics = {
             "solution_patch": solution_patch,
-            "solution_metadata": {
-                "oracle_mode": True, 
-                "instance_id": instance_id,
-                "sandbox_id": sandbox_id if 'sandbox_id' in locals() else None,
-                "run_id": run_id
-            },
-            "oracle_messages_executed": min(10, len(assistant_messages)),
+            "solution_metadata": {"oracle_mode": True, "instance_id": instance_id},
             "oracle_messages_count": len(self.oracle_messages) if self.oracle_messages else 0
         }
         
         logger.info(f"📊 Oracle Mode Metrics:")
-        logger.info(f"   Oracle messages executed: {metrics['oracle_messages_executed']}")
-        logger.info(f"   Total oracle messages: {metrics['oracle_messages_count']}")
+        logger.info(f"   Oracle messages count: {metrics['oracle_messages_count']}")
         logger.info(f"   Solution patch length: {len(solution_patch) if solution_patch else 0}")
         logger.info(f"   Instance ID: {instance_id}")
-        logger.info(f"   Run ID: {run_id}")
         
         # Return simplified output
         output = AgentLoopOutput(
