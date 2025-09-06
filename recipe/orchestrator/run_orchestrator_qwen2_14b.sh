@@ -175,6 +175,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.format=default \
     actor_rollout_ref.rollout.multi_turn._target_=verl.workers.config.rollout.OrchestratorMultiTurnConfig \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
+    actor_rollout_ref.rollout.max_model_len=$max_model_len \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.temperature=0.7 \

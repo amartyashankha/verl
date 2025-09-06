@@ -348,7 +348,22 @@ class AsyncvLLMServer(AsyncServerBase):
         request_id: str,
         image_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
-        max_tokens = self.max_model_len - len(prompt_ids)
+        # Calculate available tokens for generation
+        available_tokens = self.max_model_len - len(prompt_ids)
+        
+        # Use the minimum of available tokens and requested max_tokens (if provided)
+        if "max_tokens" in sampling_params:
+            max_tokens = min(sampling_params.pop("max_tokens"), available_tokens)
+        else:
+            max_tokens = available_tokens
+        
+        # Safeguard: Ensure max_tokens is at least 1 to prevent vLLM errors
+        if max_tokens < 1:
+            logger.warning(f"Calculated max_tokens ({max_tokens}) is less than 1. "
+                         f"Prompt length: {len(prompt_ids)}, max_model_len: {self.max_model_len}, "
+                         f"available_tokens: {available_tokens}. Setting max_tokens to 1.")
+            max_tokens = 1
+        
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.processor)
