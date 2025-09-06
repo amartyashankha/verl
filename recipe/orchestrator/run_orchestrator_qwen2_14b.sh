@@ -58,6 +58,9 @@ modal_base_url="https://fairies--incremental-leader-agent-api" # with or without
 modal_timeout=300
 modal_evaluation_url="https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"
 
+# Oracle generation configuration (can be supplied via env when running under Modal)
+use_oracle_generation=${USE_ORACLE_GENERATION:-true}
+
 # Agent loop configuration
 agent_loop_config_path=recipe/orchestrator/agent_loop_config.yaml
 
@@ -172,6 +175,9 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.multi_turn.enable_truncation=$enable_truncation \
     +actor_rollout_ref.rollout.multi_turn.truncation_strategy=$truncation_strategy \
     +actor_rollout_ref.rollout.multi_turn.truncation_max_tokens=$truncation_max_tokens \
+    +actor_rollout_ref.rollout.multi_turn.use_oracle_generation=$use_oracle_generation \
+    +actor_rollout_ref.rollout.multi_turn.oracle_messages_file="${ORACLE_MESSAGES_FILE}" \
+    +actor_rollout_ref.rollout.multi_turn.oracle_messages_dir="${ORACLE_MESSAGES_DIR}" \
     actor_rollout_ref.rollout.multi_turn.format=default \
     actor_rollout_ref.rollout.multi_turn._target_=verl.workers.config.rollout.OrchestratorMultiTurnConfig \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \

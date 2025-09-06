@@ -71,6 +71,11 @@ class OrchestratorMultiTurnConfig(MultiTurnConfig):
     truncation_strategy: Optional[str] = None
     truncation_max_tokens: int = 16000
 
+    # Oracle generation parameters (optional; consumed by agent loop, not the engine)
+    use_oracle_generation: bool = False
+    oracle_messages_file: Optional[str] = None
+    oracle_messages_dir: Optional[str] = None
+
 
 @dataclass
 class CustomAsyncServerConfig(BaseConfig):
