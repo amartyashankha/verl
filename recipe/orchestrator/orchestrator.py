@@ -36,16 +36,20 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 class OrchestratorDataset(RLHFDataset):
-    """Dataset for orchestrator notebook agent with Modal sandboxes."""
-    
+    """Dataset for orchestrator notebook agent that only needs an instance_id.
+
+    Note: We accept a tokenizer argument for constructor compatibility with the
+    base loader, but we do not use it. This dataset does not perform tokenization.
+    """
+
     def __init__(self, data_files, tokenizer, config, processor=None, **kwargs):
         """Initialize orchestrator dataset.
-        
+
         Args:
             data_files: Path(s) to data file(s)
-            tokenizer: Tokenizer for text processing
+            tokenizer: Unused. Present for compatibility.
             config: Configuration object containing dataset settings
-            processor: Optional processor for multimodal data
+            processor: Unused for this dataset
         """
         # Extract orchestrator-specific config from the main config
         self.enable_truncation = getattr(config, 'enable_truncation', False)
@@ -53,69 +57,81 @@ class OrchestratorDataset(RLHFDataset):
         self.truncation_max_tokens = getattr(config, 'truncation_max_tokens', 16000)
         self.modal_base_url = getattr(config, 'modal_base_url', None)
         self.modal_evaluation_url = getattr(config, 'modal_evaluation_url', None)
-        
+
+        # Call parent init to leverage file downloading paths, but tokenization will be skipped
         super().__init__(data_files, tokenizer, config, processor, **kwargs)
-    
+
     def _read_files_and_tokenize(self):
-        # Load data files (could be from SWE-bench, custom datasets, etc.)
+        """Read JSON files that may be a list-of-strings and normalize to minimal records.
+
+        We keep only non-tensor fields and do not tokenize. Each row must yield an
+        `instance_id` string. Other fields are optional and can be used by the agent loop.
+        """
         dataframes = []
         for data_file in self.data_files:
-            # Specify format as 'json' to properly load JSON files
             dataframe = datasets.load_dataset("json", data_files=data_file)["train"]
-            # Process each row to add orchestrator-specific fields
+            # Normalize rows into a minimal schema; robust to list-of-strings inputs
             dataframe = dataframe.map(self.map_fn, num_proc=16)
             dataframes.append(dataframe)
         self.dataframe = datasets.concatenate_datasets(dataframes)
-        logger.info(f"Loaded {len(self.dataframe)} examples for orchestrator agent")
-    
+        logger.info(f"Loaded {len(self.dataframe)} instances for orchestrator (instance_id-only)")
+
     def map_fn(self, row: dict):
-        """Map dataset row to orchestrator format."""
-        # Extract problem/task description
-        problem = row.get("problem", row.get("prompt", ""))
-        instance_id = row.get("instance_id", f"instance_{row.get('id', 0)}")
-        
-        # Create initial prompt for the orchestrator
-        prompt_content = f"""You are an AI coding assistant working in a Jupyter-like notebook environment.
+        """Normalize a dataset row to a minimal schema with just an instance_id.
 
-Problem: {problem}
+        Supports JSON that is a list of strings. HF will expose such lists under
+        a single column (commonly 'text'). We try common keys and also handle the
+        single-column case gracefully.
+        """
+        instance_id = None
+        if isinstance(row, dict):
+            # Try common keys first
+            for key in ("instance_id", "text", "id", "name"):
+                val = row.get(key)
+                if isinstance(val, str) and val:
+                    instance_id = val
+                    break
+            # If there's only one column, take its value as instance_id
+            if instance_id is None and len(row) == 1:
+                instance_id = str(next(iter(row.values())))
+        else:
+            # Fallback if a bare value is encountered
+            instance_id = str(row)
 
-Instructions:
-- Write Python code to solve this problem
-- Each code block should be wrapped in <code>...</code> tags
-- The code will be executed sequentially in a persistent environment
-- You can use print statements to debug and verify your solution
-- Import any necessary libraries at the beginning
+        if not instance_id:
+            raise ValueError(f"Could not infer instance_id from row: {row}")
 
-Begin by understanding the problem and implementing a solution."""
-        
-        data = {
-            "data_source": row.get("data_source", "orchestrator_dataset"),
-            "prompt": [{"role": "user", "content": prompt_content}],
-            # Provide a clean task prompt for initializing the notebook first cell
-            "task_prompt": problem,
-            "ability": row.get("ability", "CODING"),
-            "reward_model": {
-                "ground_truth": row.get("ground_truth", row.get("answer", "")),
-                "test_cases": row.get("test_cases", []),
-            },
-            "agent_name": "orchestrator_coding_agent",  # CRITICAL: This selects our agent
+        return {
+            "data_source": "swegym",
+            "ability": "CODING",
+            "agent_name": "orchestrator_coding_agent",
             "instance_id": instance_id,
             "run_id": f"run_{instance_id}",
             "notebook_id": "main",
-            # Dataset information for evaluation
-            "dataset_name": row.get("dataset_name", "princeton-nlp/SWE-bench_Verified"),
-            "split": row.get("split", "test"),
-            # Pass truncation config to the agent
+            # Defaults for evaluation context; agent/reward loop can override/ignore
+            "dataset_name": "princeton-nlp/SWE-bench_Verified",
+            "split": "test",
+            # Pass-through agent config if needed downstream
             "agent_config": {
                 "enable_truncation": self.enable_truncation,
                 "truncation_strategy": self.truncation_strategy,
                 "truncation_max_tokens": self.truncation_max_tokens,
             },
-            # Pass Modal configuration for evaluation
             "modal_base_url": self.modal_base_url,
-            "modal_evaluation_url": self.modal_evaluation_url
+            "modal_evaluation_url": self.modal_evaluation_url,
         }
-        return data
+
+    def __getitem__(self, idx):
+        """Return a minimal non-tensor sample with only orchestration metadata.
+
+        We avoid the base class tokenization path entirely.
+        """
+        row_dict: dict = self.dataframe[idx]
+        # Ensure required field exists
+        instance_id = row_dict.get("instance_id")
+        if not instance_id:
+            raise ValueError(f"instance_id missing at index {idx}")
+        return row_dict
 
 
 async def compute_score(data_dict: dict, response: Union[str, list[dict]], grader=None, **kwargs) -> float:

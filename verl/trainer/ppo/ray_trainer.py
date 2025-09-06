@@ -631,7 +631,12 @@ class RayPPOTrainer:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        # Only pop tensor keys that actually exist to support datasets without token tensors
+        if batch.batch is not None:
+            existing_tensor_keys = set(batch.batch.keys())
+            batch_keys_to_pop = [k for k in ["input_ids", "attention_mask", "position_ids"] if k in existing_tensor_keys]
+        else:
+            batch_keys_to_pop = []
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -667,10 +672,14 @@ class RayPPOTrainer:
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            # Store original inputs if available; otherwise, fall back to instance_id for logging
+            if test_batch.batch is not None and "input_ids" in test_batch.batch.keys():
+                input_ids = test_batch.batch["input_ids"]
+                # TODO: Can we keep special tokens except for padding tokens?
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            else:
+                inst_ids = test_batch.non_tensor_batch.get("instance_id", np.array(["unknown"] * len(test_batch)))
+                input_texts = [str(x) for x in inst_ids]
             sample_inputs.extend(input_texts)
 
             ground_truths = [
@@ -711,6 +720,10 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            # Ensure tensor batch is initialized before union when original dataset has no tensors
+            if test_batch.batch is None:
+                from tensordict import TensorDict
+                test_batch.batch = TensorDict(source={}, batch_size=(len(test_batch),))
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 

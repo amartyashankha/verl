@@ -23,6 +23,7 @@ from uuid import uuid4
 
 # TOREVIEW (Shankha): Import httpx for Modal API calls
 import httpx
+from datasets import load_dataset
 
 # TOREVIEW (Shankha): Import truncation utilities for AST-based compaction
 from verl.experimental.agent_loop.utils.compact_truncate import truncate_conversation
@@ -140,7 +141,8 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        messages = list(kwargs["raw_prompt"])
+        # Sandbox handles full prompt generation; default to empty if not provided
+        messages = list(kwargs.get("raw_prompt", [{"role": "user", "content": ""}]))
         image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
         metrics = {}
         request_id = uuid4().hex
@@ -155,6 +157,32 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         notebook_id = kwargs.get("notebook_id", "main")
         task_prompt = kwargs.get("task_prompt", None)
         dataset_name = kwargs.get("dataset_name", "princeton-nlp/SWE-bench_Verified")
+        split = kwargs.get("split", ("train" if "swe-gym" in dataset_name.lower() else "test"))
+
+        # If not provided, try to derive task_prompt by looking up the instance in the dataset
+        if not task_prompt and instance_id:
+            try:
+                ds = load_dataset(dataset_name, split=split)
+                # Find matching instance
+                found = None
+                for row in ds:
+                    if row.get("instance_id") == instance_id:
+                        found = row
+                        break
+                if found:
+                    # Prefer common problem keys, fallback to combined fields
+                    for key in ("problem_statement", "problem", "prompt", "title", "description"):
+                        if key in found and isinstance(found[key], str) and found[key].strip():
+                            task_prompt = found[key]
+                            break
+                    if not task_prompt:
+                        # Best effort: join some text-like fields
+                        text_fields = [
+                            str(found[k]) for k in found.keys() if isinstance(found.get(k), str)
+                        ]
+                        task_prompt = "\n\n".join(text_fields)[:5000] if text_fields else None
+            except Exception as e:
+                logger.warning(f"Failed to derive task prompt for {instance_id} from {dataset_name}:{split}: {e}")
         
         # TOREVIEW (Shankha): Check if httpx is available
         if httpx is None:
