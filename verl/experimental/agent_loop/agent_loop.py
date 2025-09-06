@@ -276,9 +276,32 @@ class RewardManagerWorker:
             },
             batch_size=1,
         )
+        # Structure the data properly for the reward manager and evaluation endpoint
+        # The solution patch from the agent loop needs to be passed through
         non_tensor_batch = {
-            **{k: np.array([v]) for k, v in kwargs.items()},
             "__num_turns__": np.array([output.num_turns]),
+            # Add reward_model structure expected by the reward manager
+            "reward_model": kwargs.get("reward_model", {"ground_truth": None}),
+            "data_source": kwargs.get("data_source", "unknown"),
+            # CRITICAL: Pass the solution patch through extra_info -> metrics
+            # This is what compute_score in orchestrator.py expects to send to the eval endpoint
+            "extra_info": {
+                "metrics": output.metrics if output.metrics else {},
+                "num_turns": output.num_turns,
+                **kwargs.get("extra_info", {})
+            },
+            # Pass through dataset info needed for Modal evaluation endpoint
+            "instance_id": kwargs.get("instance_id", "unknown"),
+            "dataset_name": kwargs.get("dataset_name", "princeton-nlp/SWE-bench_Verified"), 
+            "split": kwargs.get("split", "test"),
+            "modal_evaluation_url": kwargs.get("modal_evaluation_url",
+                                              "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"),
+            "run_id": kwargs.get("run_id", f"verl_eval_{kwargs.get('instance_id', 'unknown')}"),
+            # Keep other kwargs, properly structured
+            **{k: np.array([v]) if not isinstance(v, (dict, list)) else v
+               for k, v in kwargs.items()
+               if k not in ["reward_model", "data_source", "extra_info", "__num_turns__",
+                           "instance_id", "dataset_name", "split", "modal_evaluation_url", "run_id"]},
         }
         data = DataProto(
             batch=batch,
@@ -296,14 +319,16 @@ class RewardManagerWorker:
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle]):
+    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], worker_id: int = 0):
         """Initialize agent loop manager.
 
         Args:
             config (DictConfig): YAML config.
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            worker_id (int): Unique identifier for this worker (default: 0).
         """
         self.config = config
+        self.worker_id = worker_id
         self.server_manager = AsyncLLMServerManager(config, server_handles)
 
         model_path = config.actor_rollout_ref.model.path
@@ -420,7 +445,7 @@ class AgentLoopWorker:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, worker_id=self.worker_id, **kwargs)
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
             if output.reward_score is None and not self.config.reward_model.enable:
@@ -691,7 +716,7 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
-                ).remote(self.config, self.async_llm_servers)
+                ).remote(self.config, self.async_llm_servers, worker_id=i)
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:

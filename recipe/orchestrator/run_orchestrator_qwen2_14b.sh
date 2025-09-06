@@ -56,7 +56,7 @@ model_path=$DATA_ROOT/checkpoint/qwen-2.5-14b-instruct-sft
 # Modal configuration: prefix only (the agent loop appends -*.modal.run)
 modal_base_url="https://fairies--incremental-leader-agent-api" # with or without the -run?
 modal_timeout=300
-modal_evaluation_url="https://fairies--swe-gym-evaluation-service-polling-evaluate-patch.modal.run"
+modal_evaluation_url="https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"
 
 # Agent loop configuration
 agent_loop_config_path=recipe/orchestrator/agent_loop_config.yaml
@@ -85,6 +85,20 @@ train_batch_size=8  # Reduce for 14B model (32 default)
 ppo_mini_batch_size=2  # Reduce for 14B model (8 default)
 n_resp_per_prompt=2  # Reduce for 14B model (4 default)
 n_resp_per_prompt_val=2  # Reduce for 14B model (8 default)
+val_batch_size=16  # Process validation in batches to avoid overwhelming Modal API
+
+# Debug mode settings (set DEBUG_MODE=true to enable)
+if [[ "${DEBUG_MODE:-false}" == "true" ]]; then
+    echo "DEBUG MODE: Using faster settings for development"
+    train_batch_size=2
+    val_batch_size=4
+    n_resp_per_prompt=1
+    n_resp_per_prompt_val=1
+    # Use fewer tensor parallel workers (faster loading)
+    infer_tp=4
+    # Skip validation initially  
+    val_before_train=False
+fi
 
 # Truncation settings
 enable_truncation=true
@@ -110,6 +124,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files="$test_files" \
     data.return_raw_chat=True \
     data.train_batch_size=$train_batch_size \
+    data.val_batch_size=$val_batch_size \
     data.max_prompt_length=$max_prompt_length \
     data.max_response_length=$max_response_length \
     data.filter_overlong_prompts=True \

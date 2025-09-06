@@ -17,7 +17,7 @@ model_path=$DATA_ROOT/checkpoint/qwen-2.5-7b-instruct-sft
 # Modal configuration
 modal_base_url="https://fairies--incremental-leader-agent-api"
 modal_timeout=300
-modal_evaluation_url="https://fairies--evaluation-service-evaluate-patch.modal.run"
+modal_evaluation_url="https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"
 
 # Agent loop configuration
 agent_loop_config_path=recipe/orchestrator/agent_loop_config.yaml

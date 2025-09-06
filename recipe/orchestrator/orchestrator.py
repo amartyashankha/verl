@@ -73,21 +73,46 @@ class OrchestratorDataset(RLHFDataset):
             # Load SWE-Gym only
             try:
                 swe_gym = load_dataset("SWE-Gym/SWE-Gym", split="train")
+                logger.info(f"Loading SWE-Gym dataset with {len(swe_gym)} instances")
+                
+                stored_count = 0
+                missing_count = 0
+                
                 for item in swe_gym:
                     instance_id = item.get("instance_id")
                     if instance_id:
-                        # Extract problem statement
-                        task_prompt = None
-                        for key in ("problem_statement", "problem", "prompt", "title", "description"):
-                            if key in item and isinstance(item[key], str) and item[key].strip():
-                                task_prompt = item[key]
-                                break
-                        if task_prompt:
-                            self._problem_statements_cache[instance_id] = task_prompt
+                        # Extract problem statement - SWE-Gym uses "problem_statement" field
+                        problem_statement = item.get("problem_statement")
+                        if problem_statement and isinstance(problem_statement, str) and problem_statement.strip():
+                            self._problem_statements_cache[instance_id] = problem_statement
+                            stored_count += 1
+                        else:
+                            # Fallback to other possible fields if problem_statement is missing
+                            found_fallback = False
+                            for key in ("problem", "prompt", "task_prompt", "description"):
+                                if key in item and isinstance(item[key], str) and item[key].strip():
+                                    self._problem_statements_cache[instance_id] = item[key]
+                                    logger.debug(f"Used fallback field '{key}' for instance {instance_id}")
+                                    stored_count += 1
+                                    found_fallback = True
+                                    break
+                            if not found_fallback:
+                                missing_count += 1
+                                logger.debug(f"No problem statement found for instance {instance_id}")
+                
+                # Log summary and sample of what's in the cache
+                logger.info(f"Pre-loaded {len(self._problem_statements_cache)} problem statements from SWE-Gym")
+                logger.info(f"  Stored: {stored_count}, Missing: {missing_count}")
+                
+                # Show a few sample entries to verify cache contents
+                if self._problem_statements_cache:
+                    sample_items = list(self._problem_statements_cache.items())[:3]
+                    for instance_id, problem in sample_items:
+                        logger.info(f"  Sample cache entry: {instance_id} -> {problem[:100]}...")
+                        
             except Exception as e:
                 logger.warning(f"Failed to load SWE-Gym dataset: {e}")
                 
-            logger.info(f"Pre-loaded {len(self._problem_statements_cache)} problem statements from SWE-Gym")
         except ImportError:
             logger.warning("datasets library not available, problem statements will not be loaded")
 
@@ -106,7 +131,7 @@ class OrchestratorDataset(RLHFDataset):
         self.dataframe = datasets.concatenate_datasets(dataframes)
         logger.info(f"Loaded {len(self.dataframe)} instances for orchestrator (instance_id-only)")
 
-    def map_fn(self, row: dict):
+    def map_fn(self, row):
         """Normalize a dataset row to a minimal schema with just an instance_id.
 
         Supports JSON that is a list of strings. HF will expose such lists under
@@ -114,22 +139,46 @@ class OrchestratorDataset(RLHFDataset):
         single-column case gracefully.
         """
         instance_id = None
-        if isinstance(row, dict):
+        
+        # Handle LazyRow objects from datasets library (they act like dicts but aren't dict instances)
+        # Also handle regular dicts
+        if hasattr(row, '__getitem__') and hasattr(row, 'keys'):
             # Try common keys first
             for key in ("instance_id", "text", "id", "name"):
-                val = row.get(key)
-                if isinstance(val, str) and val:
-                    instance_id = val
-                    break
+                if key in row:
+                    val = row[key]
+                    if isinstance(val, str) and val:
+                        instance_id = val
+                        break
+            
             # If there's only one column, take its value as instance_id
             if instance_id is None and len(row) == 1:
-                instance_id = str(next(iter(row.values())))
+                # Get the first (and only) value
+                val = row[next(iter(row.keys()))]
+                if isinstance(val, str):
+                    instance_id = val
+                elif isinstance(val, (int, float)):
+                    instance_id = str(val)
+                else:
+                    # This shouldn't happen, but log it for debugging
+                    logger.warning(f"Unexpected value type in single-column row: {type(val).__name__} = {val!r}")
+                    logger.warning(f"Row keys: {list(row.keys())}, Row: {dict(row)}")
+                    raise ValueError(f"Could not extract instance_id from single-column row with value type {type(val).__name__}")
+        elif isinstance(row, str):
+            # If row is already a string, use it directly
+            instance_id = row
         else:
-            # Fallback if a bare value is encountered
-            instance_id = str(row)
+            # This shouldn't happen - log the unexpected type
+            logger.warning(f"Unexpected row type: {type(row).__name__}")
+            logger.warning(f"Row has __getitem__: {hasattr(row, '__getitem__')}, has keys: {hasattr(row, 'keys')}")
+            try:
+                logger.warning(f"Row as dict: {dict(row)}")
+            except:
+                logger.warning(f"Could not convert row to dict")
+            raise ValueError(f"Unexpected row type: {type(row).__name__}")
 
         if not instance_id:
-            raise ValueError(f"Could not infer instance_id from row: {row}")
+            raise ValueError(f"Could not infer instance_id from row: {row!r}")
         
         # Determine dataset based on instance_id pattern
         # SWE-Gym instances typically don't have double underscores
@@ -138,9 +187,15 @@ class OrchestratorDataset(RLHFDataset):
         split = "train" 
         
         # Get problem statement from cache
+        # Debug: log what we're looking up
+        logger.debug(f"Looking up instance_id: {instance_id!r} (type: {type(instance_id).__name__})")
         task_prompt = self._problem_statements_cache.get(instance_id)
         if not task_prompt:
-            logger.debug(f"No problem statement found in cache for {instance_id}")
+            logger.debug(f"No problem statement found in cache for {instance_id!r}")
+            # Also log a sample of what's in the cache for debugging
+            if self._problem_statements_cache:
+                sample_keys = list(self._problem_statements_cache.keys())[:3]
+                logger.debug(f"Sample cache keys: {sample_keys}")
 
         return {
             "data_source": "swegym",
@@ -189,23 +244,32 @@ async def compute_score(data_dict: dict, response: Union[str, list[dict]], grade
     
     # TODO (Shankha): Add logging to debug data flow
     logger.info(f"Computing reward for instance {data_dict.get('instance_id')}")
-    logger.debug(f"Solution patch length: {len(solution_patch)}")
-    logger.debug(f"Solution metadata: {solution_metadata}")
     
     if not solution_patch:
-        logger.warning("No solution patch found in metrics, checking for fallback")
-        # TODO (Shankha): Implement fallback logic if needed
-        # For example, try to extract from response text
+        logger.warning(f"No solution patch found for {data_dict.get('instance_id')}")
+        logger.warning(f"Available metrics keys: {list(extra_info.get('metrics', {}).keys())}")
+        logger.warning(f"Full metrics content: {extra_info.get('metrics', {})}")
         return 0.0
     
+    # Log patch details for debugging
+    patch_lines = solution_patch.split('\n')
+    logger.info(f"Solution patch for {data_dict.get('instance_id')}: {len(patch_lines)} lines, {len(solution_patch)} chars")
+    if len(patch_lines) <= 10:
+        logger.info(f"Full patch:\n{solution_patch}")
+    else:
+        logger.info(f"Patch preview (first 5 lines):\n{chr(10).join(patch_lines[:5])}")
+        logger.info(f"... ({len(patch_lines) - 10} lines omitted) ...")
+        logger.info(f"Patch preview (last 5 lines):\n{chr(10).join(patch_lines[-5:])}")
+    
     # TOREVIEW (Jeffrey): Get Modal evaluation URL from config
-    modal_evaluation_url = data_dict.get("modal_evaluation_url", "https://fairies--evaluation-service-evaluate-patch.modal.run")
+    modal_evaluation_base_url = data_dict.get("modal_evaluation_url", "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run")
+    modal_submit_url = f"{modal_evaluation_base_url}/submit"
     
     try:
         # Call Modal evaluation endpoint for SWE-bench instances
         async with httpx.AsyncClient(timeout=600) as client:  # Increased timeout for evaluation
             reward_response = await client.post(
-                modal_evaluation_url,
+                modal_submit_url,
                 json={
                     "instance_id": data_dict.get("instance_id"),
                     "patch": solution_patch,

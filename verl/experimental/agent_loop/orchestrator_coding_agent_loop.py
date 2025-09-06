@@ -196,8 +196,14 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         
         # TOREVIEW (Shankha): Extract instance_id and run_id from kwargs
         instance_id = kwargs.get("instance_id", "default_instance")
-        run_id = kwargs.get("run_id", f"run_{request_id}")
+        worker_id = kwargs.get("worker_id", 0)
+        # IMPORTANT: Make run_id unique per worker to avoid sandbox collisions
+        # Multiple workers may process the same instance simultaneously (especially during validation)
+        # We use a simple format: run_w{worker_id}_{request_id[:8]}
+        # The Modal endpoint will combine this with instance_id to create the final sandbox key
+        run_id = f"run_w{worker_id}_{request_id[:8]}"
         notebook_id = kwargs.get("notebook_id", "main")
+        logger.info(f"Worker {worker_id} processing {instance_id} with run_id: {run_id}")
         task_prompt = kwargs.get("task_prompt", None)
         dataset_name = kwargs.get("dataset_name", "SWE-Gym/SWE-Gym")
         split = kwargs.get("split", ("train" if "swe-gym" in dataset_name.lower() else "test"))
@@ -214,25 +220,62 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         # TOREVIEW (Shankha): Initialize HTTP client and sandbox
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
             # TOREVIEW (Shankha): Initialize the sandbox for this agent
-            init_response = await client.post(
-                self._endpoint("init-sandbox"),  # Modal function: init_sandbox
-                json={
-                    "dataset": dataset_name,
-                    "instance_id": instance_id,
-                    "run_id": run_id,
-                    "notebook_id": notebook_id,
-                    "model_endpoint": "verl",  # TODO: Get from config if needed
-                    "truncation_strategy": self.truncation_strategy or "ast_llm_compaction",
-                    "max_tokens": self.truncation_max_tokens,
-                    # Pass task_prompt to trigger first-cell creation and prompt file write
-                    **({"task_prompt": task_prompt} if task_prompt else {})
-                }
-            )
-            init_data = init_response.json()
-            if not init_data.get("success"):
-                logger.error(f"Failed to initialize Modal sandbox: {init_data}")
-                # TODO: Decide how to handle initialization failure
-                raise RuntimeError(f"Failed to initialize Modal sandbox: {init_data}")
+            endpoint_url = self._endpoint("init-sandbox")
+            logger.info(f"Calling Modal endpoint: {endpoint_url}")
+            
+            try:
+                init_response = await client.post(
+                    endpoint_url,  # Modal function: init_sandbox
+                    json={
+                        "dataset": dataset_name,
+                        "instance_id": instance_id,
+                        "run_id": run_id,
+                        "notebook_id": notebook_id,
+                        "model_endpoint": "verl",  # TODO: Get from config if needed
+                        "truncation_strategy": self.truncation_strategy or "ast_llm_compaction",
+                        "max_tokens": self.truncation_max_tokens,
+                        # Pass task_prompt to trigger first-cell creation and prompt file write
+                        **({"task_prompt": task_prompt} if task_prompt else {})
+                    }
+                )
+                
+                # Check HTTP status code first
+                if init_response.status_code != 200:
+                    error_msg = f"Modal API returned status {init_response.status_code}"
+                    try:
+                        error_detail = init_response.text
+                        error_msg += f": {error_detail}"
+                    except:
+                        pass
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+                
+                # Check if response has content
+                if not init_response.content:
+                    logger.error("Modal API returned empty response")
+                    raise RuntimeError("Modal API returned empty response - service may be down or endpoint may be incorrect")
+                
+                # Try to parse JSON
+                try:
+                    init_data = init_response.json()
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse Modal response as JSON: {e}")
+                    logger.error(f"Response content: {init_response.text[:500]}")  # Log first 500 chars
+                    raise RuntimeError(f"Modal API returned invalid JSON: {e}")
+                
+                # Handle both successful creation and existing sandbox cases
+                if init_data.get("success") or init_data.get("status") == "exists":
+                    # Sandbox either created successfully or already exists - both are OK
+                    if init_data.get("status") == "exists":
+                        logger.info(f"Reusing existing Modal sandbox: {init_data.get('sandbox_id')} for {instance_id}")
+                else:
+                    logger.error(f"Failed to initialize Modal sandbox: {init_data}")
+                    # TODO: Decide how to handle initialization failure
+                    raise RuntimeError(f"Failed to initialize Modal sandbox: {init_data}")
+                    
+            except httpx.RequestError as e:
+                logger.error(f"Network error calling Modal API: {e}")
+                raise RuntimeError(f"Failed to connect to Modal API at {endpoint_url}: {e}")
             
             sandbox_id = init_data.get("sandbox_id")
             logger.info(f"Initialized Modal sandbox: {sandbox_id}")
@@ -385,7 +428,20 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                                     "cell_content": code_block.strip()
                                 }
                             )
-                            exec_data = exec_response.json()
+                            
+                            # Check status and parse response
+                            if exec_response.status_code != 200:
+                                logger.error(f"Modal execute-cell returned status {exec_response.status_code}")
+                                exec_data = {"success": False, "error": f"HTTP {exec_response.status_code}"}
+                            elif not exec_response.content:
+                                logger.error("Modal execute-cell returned empty response")
+                                exec_data = {"success": False, "error": "Empty response"}
+                            else:
+                                try:
+                                    exec_data = exec_response.json()
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"Failed to parse execute-cell response: {e}")
+                                    exec_data = {"success": False, "error": f"Invalid JSON: {e}"}
                             
                             # TOREVIEW (Jeffrey): Check for critical errors that should stop execution
                             if exec_data.get("terminated", False):
@@ -543,13 +599,38 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 )
                 
                 if solution_response.status_code == 200:
-                    solution_data = solution_response.json()
-                    if solution_data.get("success"):
-                        solution_patch = solution_data.get("patch", "")
-                        solution_metadata = solution_data.get("metadata", {})
-                        logger.info(f"Successfully extracted solution patch for {instance_id}")
+                    if not solution_response.content:
+                        logger.warning("get-solution-patch returned empty response")
                     else:
-                        logger.warning(f"Failed to get solution: {solution_data}")
+                        try:
+                            solution_data = solution_response.json()
+                            if solution_data.get("success"):
+                                solution_patch = solution_data.get("patch", "")
+                                solution_metadata = solution_data.get("metadata", {})
+                                logger.info(f"Successfully extracted solution patch for {instance_id}")
+                                
+                                # Log the actual patch content for debugging
+                                if solution_patch:
+                                    patch_lines = solution_patch.split('\n')
+                                    logger.info(f"Solution patch preview for {instance_id} ({len(patch_lines)} lines):")
+                                    # Show first 10 and last 5 lines of the patch
+                                    if len(patch_lines) <= 15:
+                                        for line in patch_lines:
+                                            logger.info(f"  {line}")
+                                    else:
+                                        logger.info("  --- First 10 lines ---")
+                                        for line in patch_lines[:10]:
+                                            logger.info(f"  {line}")
+                                        logger.info(f"  ... ({len(patch_lines) - 15} lines omitted) ...")
+                                        logger.info("  --- Last 5 lines ---")
+                                        for line in patch_lines[-5:]:
+                                            logger.info(f"  {line}")
+                                else:
+                                    logger.warning(f"Empty solution patch extracted for {instance_id}")
+                            else:
+                                logger.warning(f"Failed to get solution: {solution_data}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse solution response: {e}")
                 else:
                     logger.error(f"Solution extraction failed with status {solution_response.status_code}")
                     
