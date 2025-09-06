@@ -400,7 +400,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 # new_images_this_turn = []  # TOREVIEW (Shankha): Not handling images from code execution yet
                 for tool_response in tool_responses:
                     # TOREVIEW (Shankha): Simplified message format for code outputs
-                    message = {"role": "tool", "content": tool_response.text or ""}
+                    message = {"role": "user", "content": tool_response.text or ""}
                     tool_messages.append(message)
                 
                 # TOREVIEW (Shankha): Update conversation messages with tool responses

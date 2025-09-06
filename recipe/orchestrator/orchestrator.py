@@ -109,16 +109,8 @@ class OrchestratorDataset(RLHFDataset):
             "run_id": f"run_{instance_id}",
             "notebook_id": "main",
             # Defaults for evaluation context; agent/reward loop can override/ignore
-            "dataset_name": "princeton-nlp/SWE-bench_Verified",
-            "split": "test",
-            # Pass-through agent config if needed downstream
-            "agent_config": {
-                "enable_truncation": self.enable_truncation,
-                "truncation_strategy": self.truncation_strategy,
-                "truncation_max_tokens": self.truncation_max_tokens,
-            },
-            "modal_base_url": self.modal_base_url,
-            "modal_evaluation_url": self.modal_evaluation_url,
+            "dataset_name": "SWE-Gym/SWE-Gym",
+            "split": "train",
         }
 
     def __getitem__(self, idx):
