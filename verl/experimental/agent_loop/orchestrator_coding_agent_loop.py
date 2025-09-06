@@ -1319,14 +1319,14 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 # can't be propagated to previous token in GAE.
                 # Removed response length limit - only stop on meaningful conditions
 
-                prompt_ids += tool_response_ids
+                prompt_ids += tool_response_ids # interleaved, we only care about system messages here
                 response_mask += [0] * len(tool_response_ids)
                 if response_logprobs:
-                    response_logprobs += [0.0] * len(tool_response_ids)
+                    response_logprobs += [0.0] * len(tool_response_ids) # need to get this from actual vllm server
                 user_turns += 1
 
         response_ids = prompt_ids[-len(response_mask) :]
-        prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)]
+        prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)] 
 
         multi_modal_data = {"image": image_data} if image_data is not None else {}
 
