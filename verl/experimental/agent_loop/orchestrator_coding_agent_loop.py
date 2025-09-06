@@ -96,12 +96,16 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         # Normalize modal endpoint helpers to avoid malformed hostnames
         def _compose_endpoint(path_suffix: str) -> str:
             base = cls.modal_base_url.rstrip('/')
-            # Accept callers passing leading "-" or "/" and normalize once
+            # Modal converts function names with underscores to hyphens in URLs
+            # e.g., init_sandbox -> init-sandbox
+            # Remove any leading hyphens or slashes from the suffix
             normalized_suffix = path_suffix.lstrip('/-')
             if base.endswith('.modal.run'):
                 # Full domain provided: use path-based endpoints
                 return f"{base}/{normalized_suffix}"
             # Prefix provided: construct subdomain per Modal convention
+            # Modal app name: incremental-leader-agent-api
+            # Function: init_sandbox -> URL: incremental-leader-agent-api-init-sandbox.modal.run
             return f"{base}-{normalized_suffix}.modal.run"
 
         cls._endpoint = staticmethod(_compose_endpoint)
@@ -158,31 +162,11 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         task_prompt = kwargs.get("task_prompt", None)
         dataset_name = kwargs.get("dataset_name", "princeton-nlp/SWE-bench_Verified")
         split = kwargs.get("split", ("train" if "swe-gym" in dataset_name.lower() else "test"))
-
-        # If not provided, try to derive task_prompt by looking up the instance in the dataset
-        if not task_prompt and instance_id:
-            try:
-                ds = load_dataset(dataset_name, split=split)
-                # Find matching instance
-                found = None
-                for row in ds:
-                    if row.get("instance_id") == instance_id:
-                        found = row
-                        break
-                if found:
-                    # Prefer common problem keys, fallback to combined fields
-                    for key in ("problem_statement", "problem", "prompt", "title", "description"):
-                        if key in found and isinstance(found[key], str) and found[key].strip():
-                            task_prompt = found[key]
-                            break
-                    if not task_prompt:
-                        # Best effort: join some text-like fields
-                        text_fields = [
-                            str(found[k]) for k in found.keys() if isinstance(found.get(k), str)
-                        ]
-                        task_prompt = "\n\n".join(text_fields)[:5000] if text_fields else None
-            except Exception as e:
-                logger.warning(f"Failed to derive task prompt for {instance_id} from {dataset_name}:{split}: {e}")
+        
+        # TOREVIEW (Jeffrey): task_prompt now comes from the dataset
+        # No need to load the dataset again here
+        if not task_prompt:
+            logger.warning(f"No task_prompt provided for {instance_id}. Modal sandbox will start without initial problem statement.")
         
         # TOREVIEW (Shankha): Check if httpx is available
         if httpx is None:
@@ -192,13 +176,15 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
             # TOREVIEW (Shankha): Initialize the sandbox for this agent
             init_response = await client.post(
-                self._endpoint("-init-sandbox"),
+                self._endpoint("init-sandbox"),  # Modal function: init_sandbox
                 json={
                     "dataset": dataset_name,
                     "instance_id": instance_id,
                     "run_id": run_id,
                     "notebook_id": notebook_id,
                     "model_endpoint": "verl",  # TODO: Get from config if needed
+                    "truncation_strategy": self.truncation_strategy or "ast_llm_compaction",
+                    "max_tokens": self.truncation_max_tokens,
                     # Pass task_prompt to trigger first-cell creation and prompt file write
                     **({"task_prompt": task_prompt} if task_prompt else {})
                 }
@@ -345,12 +331,13 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
 
                 # TOREVIEW (Shankha): Execute code blocks (sequentially, as notebooks are stateful)
                 tool_responses = []
+                execution_errors = []  # Track actual exceptions
                 with simple_timer("code_execution", metrics):
                     for code_block in code_blocks:
                         try:
                             # TOREVIEW (Shankha): Execute code via Modal API
                             exec_response = await client.post(
-                                self._endpoint("-execute-cell"),
+                                self._endpoint("execute-cell"),  # Modal function: execute_cell
                                 json={
                                     "instance_id": instance_id,
                                     "run_id": run_id,
@@ -359,6 +346,14 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                                 }
                             )
                             exec_data = exec_response.json()
+                            
+                            # TOREVIEW (Jeffrey): Check for critical errors that should stop execution
+                            if exec_data.get("terminated", False):
+                                # Kernel died or critical error - stop execution
+                                logger.error(f"Kernel terminated during execution")
+                                execution_errors.append(Exception("Kernel terminated"))
+                                tool_responses.append(ToolResponse(text="Error: Kernel terminated during execution"))
+                                break
                             
                             # TOREVIEW (Shankha): Create a ToolResponse compatible object
                             if exec_data.get("success"):
@@ -390,9 +385,12 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                             
                         except Exception as e:
                             logger.error(f"Error executing code block: {e}")
+                            execution_errors.append(e)
                             tool_responses.append(ToolResponse(text=f"Error executing code: {str(e)}"))
                             
-                if any(isinstance(item, Exception) for item in tool_responses):
+                # TOREVIEW (Shankha): Break on critical execution errors
+                if execution_errors:
+                    logger.warning(f"Breaking due to {len(execution_errors)} execution errors")
                     break
 
                 # TOREVIEW (Shankha): Format tool responses as messages
@@ -496,7 +494,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 # Call Modal endpoint to get solution patch
                 # This endpoint returns the git diff of changes made in the sandbox
                 solution_response = await client.post(
-                    self._endpoint("-get-solution-patch"),
+                    self._endpoint("get-solution-patch"),  # Modal function: get_solution_patch
                     json={
                         "instance_id": instance_id,
                         "run_id": run_id,
@@ -522,7 +520,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             # Step 2: Terminate sandbox (separate from solution extraction)
             try:
                 terminate_response = await client.post(
-                    self._endpoint("-terminate-sandbox"),
+                    self._endpoint("terminate-sandbox"),  # Modal function: terminate_sandbox
                     json={
                         "instance_id": instance_id,
                         "run_id": run_id,

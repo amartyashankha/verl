@@ -38,7 +38,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 class OrchestratorDataset(RLHFDataset):
     """Dataset for orchestrator notebook agent that only needs an instance_id.
 
-    Note: We accept a tokenizer argument for constructor compatibility with the
+    Note: We accept a tokenWizer argument for constructor compatibility with the
     base loader, but we do not use it. This dataset does not perform tokenization.
     """
 
@@ -57,9 +57,56 @@ class OrchestratorDataset(RLHFDataset):
         self.truncation_max_tokens = getattr(config, 'truncation_max_tokens', 16000)
         self.modal_base_url = getattr(config, 'modal_base_url', None)
         self.modal_evaluation_url = getattr(config, 'modal_evaluation_url', None)
+        
+        # Pre-load SWE-bench/SWE-Gym datasets for efficient problem statement lookup
+        self._problem_statements_cache = {}
+        self._preload_problem_statements()
 
         # Call parent init to leverage file downloading paths, but tokenization will be skipped
         super().__init__(data_files, tokenizer, config, processor, **kwargs)
+    
+    def _preload_problem_statements(self):
+        """Pre-load problem statements from SWE-bench and SWE-Gym datasets into a cache."""
+        try:
+            from datasets import load_dataset
+            
+            # Load SWE-Gym
+            try:
+                swe_gym = load_dataset("SWE-Gym/SWE-Gym", split="train")
+                for item in swe_gym:
+                    instance_id = item.get("instance_id")
+                    if instance_id:
+                        # Extract problem statement
+                        task_prompt = None
+                        for key in ("problem_statement", "problem", "prompt", "title", "description"):
+                            if key in item and isinstance(item[key], str) and item[key].strip():
+                                task_prompt = item[key]
+                                break
+                        if task_prompt:
+                            self._problem_statements_cache[instance_id] = task_prompt
+            except Exception as e:
+                logger.warning(f"Failed to load SWE-Gym dataset: {e}")
+            
+            # Load SWE-bench Verified
+            try:
+                swe_bench = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
+                for item in swe_bench:
+                    instance_id = item.get("instance_id")
+                    if instance_id:
+                        # Extract problem statement
+                        task_prompt = None
+                        for key in ("problem_statement", "problem", "prompt", "title", "description"):
+                            if key in item and isinstance(item[key], str) and item[key].strip():
+                                task_prompt = item[key]
+                                break
+                        if task_prompt:
+                            self._problem_statements_cache[instance_id] = task_prompt
+            except Exception as e:
+                logger.warning(f"Failed to load SWE-bench dataset: {e}")
+                
+            logger.info(f"Pre-loaded {len(self._problem_statements_cache)} problem statements")
+        except ImportError:
+            logger.warning("datasets library not available, problem statements will not be loaded")
 
     def _read_files_and_tokenize(self):
         """Read JSON files that may be a list-of-strings and normalize to minimal records.
@@ -100,6 +147,18 @@ class OrchestratorDataset(RLHFDataset):
 
         if not instance_id:
             raise ValueError(f"Could not infer instance_id from row: {row}")
+        
+        # Determine dataset based on instance_id pattern
+        # SWE-Gym instances typically don't have double underscores
+        # SWE-bench instances have format: repo__issue
+        is_swe_gym = "__" not in instance_id
+        dataset_name = "SWE-Gym/SWE-Gym" if is_swe_gym else "princeton-nlp/SWE-bench_Verified"
+        split = "train" if is_swe_gym else "test"
+        
+        # Get problem statement from cache
+        task_prompt = self._problem_statements_cache.get(instance_id)
+        if not task_prompt:
+            logger.debug(f"No problem statement found in cache for {instance_id}")
 
         return {
             "data_source": "swegym",
@@ -108,9 +167,9 @@ class OrchestratorDataset(RLHFDataset):
             "instance_id": instance_id,
             "run_id": f"run_{instance_id}",
             "notebook_id": "main",
-            # Defaults for evaluation context; agent/reward loop can override/ignore
-            "dataset_name": "SWE-Gym/SWE-Gym",
-            "split": "train",
+            "dataset_name": dataset_name,
+            "split": split,
+            "task_prompt": task_prompt,  # Now included in the dataset output
         }
 
     def __getitem__(self, idx):
