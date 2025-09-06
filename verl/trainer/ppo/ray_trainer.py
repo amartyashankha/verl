@@ -526,12 +526,16 @@ class RayPPOTrainer:
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
+        
+        # In debug mode with small datasets, don't drop the last batch
+        import os
+        drop_last = os.environ.get("DEBUG_MODE", "false").lower() != "true"
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
             num_workers=num_workers,
-            drop_last=True,
+            drop_last=drop_last,
             collate_fn=collate_fn,
             sampler=train_sampler,
         )
@@ -549,7 +553,16 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
-        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        # Debug logging for dataloader sizes
+        print(f"DEBUG: Train dataset size: {len(self.train_dataset)}")
+        print(f"DEBUG: Val dataset size: {len(self.val_dataset)}")
+        print(f"DEBUG: Train batch size: {self.config.data.get('gen_batch_size', self.config.data.train_batch_size)}")
+        print(f"DEBUG: Val batch size: {val_batch_size}")
+        print(f"DEBUG: Drop last: {drop_last}")
+        print(f"DEBUG: Train dataloader length: {len(self.train_dataloader)}")
+        print(f"DEBUG: Val dataloader length: {len(self.val_dataloader)}")
+        
+        assert len(self.train_dataloader) >= 1, f"Train dataloader is empty! Dataset size: {len(self.train_dataset)}, batch_size: {self.config.data.train_batch_size}, drop_last: {drop_last}"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
         print(
@@ -1078,7 +1091,10 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        skip_validation = os.environ.get("SKIP_VALIDATION", "false").lower() == "true"
+        if skip_validation:
+            print("⚡ SKIP_VALIDATION enabled - skipping initial validation for faster startup")
+        elif self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -1111,14 +1127,18 @@ class RayPPOTrainer:
                 # Log when training actually begins
                 if self.global_steps == 1 and epoch == 0:
                     import torch
+                    print("\n" + "="*80)
+                    print("🚀🚀🚀 PPO TRAINING STARTED! 🚀🚀🚀")
+                    print("="*80)
                     if torch.cuda.is_available():
                         for i in range(torch.cuda.device_count()):
                             memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
                             memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
                             memory_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
-                            print(f"🚀 TRAINING BEGINS - GPU {i}: memory allocated (GB): {memory_allocated:.2f}, memory reserved (GB): {memory_reserved:.2f}, device memory used/total (GB): {memory_allocated:.2f}/{memory_total:.2f}")
+                            print(f"GPU {i}: memory allocated (GB): {memory_allocated:.2f}, memory reserved (GB): {memory_reserved:.2f}, device memory used/total (GB): {memory_allocated:.2f}/{memory_total:.2f}")
                     else:
-                        print("🚀 TRAINING BEGINS - No CUDA available")
+                        print("No CUDA available")
+                    print("="*80 + "\n")
                 
                 # Debug: Log start of each PPO step
                 print(f"\n{'='*80}")
@@ -1138,8 +1158,24 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # add uid to batch
+                # Handle case where batch.batch is None (e.g., orchestrator dataset with no tensors)
+                if batch.batch is not None:
+                    batch_size = len(batch.batch)
+                else:
+                    # Get batch size from non_tensor_batch if batch is None
+                    # Assume all items in non_tensor_batch have the same length
+                    non_tensor_keys = list(batch.non_tensor_batch.keys())
+                    if non_tensor_keys:
+                        first_item = batch.non_tensor_batch[non_tensor_keys[0]]
+                        if hasattr(first_item, '__len__'):
+                            batch_size = len(first_item)
+                        else:
+                            batch_size = 1
+                    else:
+                        batch_size = 1
+                
                 batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(batch_size)], dtype=object
                 )
 
                 gen_batch = self._get_gen_batch(batch)
@@ -1299,11 +1335,14 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             print(f"  🎭 Updating actor (PPO optimization)...")
+                            print(f"     📊 BEFORE UPDATE - Getting initial actor state...")
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                            print(f"     📊 AFTER UPDATE - Actor weights have been modified!")
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
                         print(f"  ✅ Actor updated (policy loss: {actor_output_metrics.get('actor/policy_loss', 'N/A'):.4f}, KL: {actor_output_metrics.get('actor/kl', 'N/A'):.4f})")
+                        print(f"     🔥 PPO UPDATE CONFIRMED - Model weights changed at step {self.global_steps}!")
                     else:
                         print(f"  ⏳ Skipping actor update (critic warmup: step {self.global_steps}/{self.config.trainer.critic_warmup})")
 

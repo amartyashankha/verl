@@ -229,32 +229,365 @@ class OrchestratorDataset(RLHFDataset):
 
 
 def compute_score(data_source: str, solution_str: str, ground_truth=None, extra_info=None, **kwargs) -> float:
-    """Compute reward score for orchestrator agent responses.
+    """Wrapper that handles both sync and async contexts for compute_score."""
+    import asyncio
+    import httpx
     
-    NOTE: The actual evaluation now happens directly in orchestrator_coding_agent_loop.py
-    This function is only called if the agent loop didn't already compute the reward.
+    # Synchronous implementation for when we're already in an async context
+    def sync_evaluate(instance_id, solution_patch, dataset_name, split, run_id, modal_evaluation_url):
+        logger.info(f"[SYNC_EVAL] Using synchronous evaluation for {instance_id}")
+        try:
+            with httpx.Client(timeout=600) as client:
+                logger.info(f"[SYNC_EVAL] Submitting to {modal_evaluation_url}/evaluate")
+                response = client.post(
+                    f"{modal_evaluation_url}/evaluate",
+                    json={
+                        "instance_id": instance_id,
+                        "patch": solution_patch,
+                        "dataset_name": dataset_name,
+                        "split": split,
+                        "run_id": run_id
+                    }
+                )
+                
+                if response.status_code == 200:
+                    reward_data = response.json()
+                    if not reward_data.get("success", False):
+                        logger.error(f"[SYNC_EVAL] Failed: {reward_data.get('error')}")
+                        return 0.0
+                    
+                    # Extract results and calculate score
+                    resolved = reward_data.get("resolved", False)
+                    tests_passed = reward_data.get("tests_passed", {})
+                    tests_failed = reward_data.get("tests_failed", {})
+                    
+                    fail_to_pass = tests_passed.get("fail_to_pass", [])
+                    pass_to_fail = tests_failed.get("pass_to_fail", [])
+                    fail_to_fail = tests_failed.get("fail_to_fail", [])
+                    
+                    total_originally_failing = len(fail_to_pass) + len(fail_to_fail)
+                    
+                    logger.info(f"[SYNC_EVAL] Resolved: {resolved}, F2P: {len(fail_to_pass)}, P2F: {len(pass_to_fail)}")
+                    
+                    if resolved:
+                        return 1.0
+                    elif total_originally_failing > 0:
+                        return len(fail_to_pass) / total_originally_failing
+                    else:
+                        return 0.0
+                else:
+                    logger.error(f"[SYNC_EVAL] HTTP {response.status_code}: {response.text[:200]}")
+                    return 0.0
+        except Exception as e:
+            logger.error(f"[SYNC_EVAL] Error: {e}")
+            return 0.0
     
-    Args:
-        data_source: The data source identifier (e.g., "swegym")
-        solution_str: The model's response (not used for orchestrator)
-        ground_truth: Ground truth if available
-        extra_info: Dictionary containing metrics and other info from agent loop
-        **kwargs: Additional arguments
-    
-    Returns:
-        float: Default reward of 0.0 (actual evaluation happens in agent loop)
-    """
-    # Log that we're in the fallback path
+    # Extract info from extra_info
     instance_id = "unknown"
+    metrics = {}
+    dataset_name = "SWE-Gym/SWE-Gym"
+    split = "train"
+    run_id = None
+    modal_evaluation_url = None
+    
     if extra_info:
         if hasattr(extra_info, '__len__') and not isinstance(extra_info, dict):
             extra_info = extra_info[0] if len(extra_info) > 0 else {}
+        
         instance_id = extra_info.get("instance_id", "unknown")
+        metrics = extra_info.get("metrics", {})
+        dataset_name = extra_info.get("dataset_name", "SWE-Gym/SWE-Gym")
+        split = extra_info.get("split", "train")
+        run_id = extra_info.get("run_id", f"verl_eval_{instance_id}")
+        modal_evaluation_url = extra_info.get("modal_evaluation_url")
     
-    logger.info(f"Fallback reward computation for {instance_id} - returning 0.0")
-    logger.info("Note: Evaluation should have happened in orchestrator_coding_agent_loop.py")
+    solution_patch = metrics.get("solution_patch", "")
     
-    # Return default score since evaluation happens in the agent loop
+    # Check for skipped instances
+    if metrics.get("skipped"):
+        logger.info(f"[COMPUTE_SCORE] Skipped instance {instance_id}: {metrics.get('reason')}")
+        return 0.0
+    
+    if not solution_patch:
+        logger.warning(f"[COMPUTE_SCORE] No solution patch for {instance_id}")
+        return 0.0
+    
+    if not modal_evaluation_url:
+        modal_evaluation_url = "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"
+    
+    logger.info(f"[COMPUTE_SCORE] Evaluating {instance_id} with patch length {len(solution_patch)}")
+    
+    # Always use synchronous evaluation since we're called from sync context
+    return sync_evaluate(instance_id, solution_patch, dataset_name, split, run_id, modal_evaluation_url)
+
+# Old async implementation removed - using simpler sync approach in compute_score above
+    
+    # Extract necessary information from extra_info
+    instance_id = "unknown"
+    metrics = {}
+    dataset_name = "SWE-Gym/SWE-Gym"
+    split = "train"
+    run_id = None
+    modal_evaluation_url = None
+    
+    if extra_info:
+        # Debug: Log extra_info structure
+        logger.debug(f"[DEBUG] extra_info structure:")
+        logger.debug(f"  Type: {type(extra_info)}")
+        logger.debug(f"  Is dict: {isinstance(extra_info, dict)}")
+        logger.debug(f"  Has __len__: {hasattr(extra_info, '__len__')}")
+        
+        # Handle both dict and array-wrapped dict
+        if hasattr(extra_info, '__len__') and not isinstance(extra_info, dict):
+            logger.debug(f"  Array-wrapped, length: {len(extra_info)}")
+            extra_info = extra_info[0] if len(extra_info) > 0 else {}
+            logger.debug(f"  Unwrapped to type: {type(extra_info)}")
+        
+        # Debug: Log extracted values
+        logger.debug(f"[DEBUG] extra_info keys: {list(extra_info.keys()) if isinstance(extra_info, dict) else 'Not a dict'}")
+        
+        instance_id = extra_info.get("instance_id", "unknown")
+        metrics = extra_info.get("metrics", {})
+        dataset_name = extra_info.get("dataset_name", "SWE-Gym/SWE-Gym")
+        split = extra_info.get("split", "train")
+        run_id = extra_info.get("run_id", f"verl_eval_{instance_id}")
+        
+        # Try to get modal_evaluation_url from extra_info
+        modal_evaluation_url = extra_info.get("modal_evaluation_url")
+        
+        logger.debug(f"[DEBUG] Extracted from extra_info:")
+        logger.debug(f"  instance_id: {instance_id}")
+        logger.debug(f"  dataset_name: {dataset_name}")
+        logger.debug(f"  split: {split}")
+        logger.debug(f"  run_id: {run_id}")
+        logger.debug(f"  modal_evaluation_url: {modal_evaluation_url}")
+        logger.debug(f"  metrics keys: {list(metrics.keys()) if isinstance(metrics, dict) else 'Not a dict'}")
+    
+    # Extract solution patch from metrics
+    solution_patch = metrics.get("solution_patch", "")
+    solution_metadata = metrics.get("solution_metadata", {})
+    
+    logger.info(f"[COMPUTE_SCORE] Computing reward for instance {instance_id}")
+    logger.debug(f"[DEBUG] Solution patch extraction:")
+    logger.debug(f"  Patch length: {len(solution_patch)} chars")
+    logger.debug(f"  Patch preview: {solution_patch[:200]}..." if solution_patch else "  No patch")
+    logger.debug(f"  Solution metadata: {solution_metadata}")
+    
+    if not solution_patch:
+        logger.warning(f"[COMPUTE_SCORE] No solution patch found for {instance_id}, returning 0.0")
+        logger.debug(f"[DEBUG] Metrics contained: {list(metrics.keys()) if metrics else 'No metrics'}")
+        return 0.0
+    
+    # Use default Modal evaluation URL if not provided
+    if not modal_evaluation_url:
+        modal_evaluation_url = "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run"
+        logger.debug(f"[DEBUG] Using default Modal evaluation URL: {modal_evaluation_url}")
+    else:
+        logger.debug(f"[DEBUG] Using provided Modal evaluation URL: {modal_evaluation_url}")
+    
+    # Define async function for evaluation
+    async def evaluate_patch():
+        try:
+            # Call Modal evaluation endpoint for SWE-bench/SWE-Gym instances
+            async with httpx.AsyncClient(timeout=600) as client:  # 10 minute timeout for evaluation
+                logger.info(f"[EVALUATION] Submitting patch for evaluation to {modal_evaluation_url}")
+                
+                # Debug: Log request payload
+                request_payload = {
+                    "instance_id": instance_id,
+                    "patch": solution_patch,
+                    "dataset_name": dataset_name,
+                    "split": split,
+                    "run_id": run_id
+                }
+                logger.debug(f"[DEBUG] Request payload:")
+                logger.debug(f"  instance_id: {instance_id}")
+                logger.debug(f"  dataset_name: {dataset_name}")
+                logger.debug(f"  split: {split}")
+                logger.debug(f"  run_id: {run_id}")
+                logger.debug(f"  patch length: {len(solution_patch)} chars")
+                
+                reward_response = await client.post(
+                    f"{modal_evaluation_url}/evaluate",
+                    json=request_payload
+                )
+                
+                logger.debug(f"[DEBUG] Response status code: {reward_response.status_code}")
+                
+                if reward_response.status_code == 200:
+                    reward_data = reward_response.json()
+                    logger.debug(f"[DEBUG] Response data keys: {list(reward_data.keys())}")
+                    
+                    # Check if evaluation was successful
+                    if not reward_data.get("success", False):
+                        logger.error(f"[EVALUATION] Failed: {reward_data.get('error', 'Unknown error')}")
+                        logger.debug(f"[DEBUG] Full error response: {reward_data}")
+                        return 0.0
+                    
+                    # Extract evaluation results
+                    resolved = reward_data.get("resolved", False)
+                    test_results = reward_data.get("test_results", {})
+                    execution_time = reward_data.get("execution_time", 0)
+                    
+                    # Extract fail-to-pass metrics (standard SWE-bench evaluation)
+                    tests_passed = reward_data.get("tests_passed", {})
+                    tests_failed = reward_data.get("tests_failed", {})
+                    
+                    # Calculate fail-to-pass ratio
+                    # These are tests that were originally failing but now pass with the patch
+                    fail_to_pass = tests_passed.get("fail_to_pass", [])
+                    pass_to_pass = tests_passed.get("pass_to_pass", [])
+                    
+                    # These are tests that should not fail (originally passing tests)
+                    pass_to_fail = tests_failed.get("pass_to_fail", [])
+                    fail_to_fail = tests_failed.get("fail_to_fail", [])
+                    
+                    # Total originally failing tests
+                    total_originally_failing = len(fail_to_pass) + len(fail_to_fail)
+                    
+                    # Log evaluation details
+                    logger.info(f"[EVALUATION] Completed in {execution_time:.2f}s")
+                    logger.info(f"[EVALUATION] Instance resolved: {resolved}")
+                    logger.info(f"[EVALUATION] Test breakdown:")
+                    logger.info(f"  Fail-to-pass: {len(fail_to_pass)} tests (fixed)")
+                    logger.info(f"  Pass-to-pass: {len(pass_to_pass)} tests (still passing)")
+                    logger.info(f"  Pass-to-fail: {len(pass_to_fail)} tests (regressions)")
+                    logger.info(f"  Fail-to-fail: {len(fail_to_fail)} tests (still failing)")
+                    
+                    # Debug: Log actual test names if available
+                    if fail_to_pass:
+                        logger.debug(f"[DEBUG] Fail-to-pass tests: {fail_to_pass[:5]}{'...' if len(fail_to_pass) > 5 else ''}")
+                    if pass_to_fail:
+                        logger.debug(f"[DEBUG] Pass-to-fail tests (regressions): {pass_to_fail[:5]}{'...' if len(pass_to_fail) > 5 else ''}")
+                    
+                    # Calculate reward based on fail-to-pass ratio
+                    # Standard SWE-bench scoring:
+                    # - 1.0 if resolved (all originally failing tests now pass, no regressions)
+                    # - Otherwise, use fail-to-pass ratio with penalties for regressions
+                    
+                    if resolved:
+                        score = 1.0
+                        logger.info(f"[SCORING] Instance fully resolved! Score: {score}")
+                    else:
+                        # Calculate base score from fail-to-pass ratio
+                        if total_originally_failing > 0:
+                            fail_to_pass_ratio = len(fail_to_pass) / total_originally_failing
+                            base_score = fail_to_pass_ratio
+                            
+                            logger.debug(f"[DEBUG] Scoring calculation:")
+                            logger.debug(f"  Total originally failing: {total_originally_failing}")
+                            logger.debug(f"  Fail-to-pass ratio: {fail_to_pass_ratio:.3f}")
+                            logger.debug(f"  Base score: {base_score:.3f}")
+                            
+                            # Apply penalty for regressions (pass-to-fail tests)
+                            # Each regression reduces the score
+                            if len(pass_to_fail) > 0:
+                                total_originally_passing = len(pass_to_pass) + len(pass_to_fail)
+                                if total_originally_passing > 0:
+                                    regression_penalty = len(pass_to_fail) / total_originally_passing * 0.5
+                                    base_score = max(0, base_score - regression_penalty)
+                                    logger.info(f"[SCORING] Applied regression penalty: -{regression_penalty:.3f} for {len(pass_to_fail)} regressions")
+                                    logger.debug(f"[DEBUG] Total originally passing: {total_originally_passing}")
+                                    logger.debug(f"[DEBUG] Score after penalty: {base_score:.3f}")
+                            
+                            score = base_score
+                            logger.info(f"[SCORING] Fail-to-pass ratio: {fail_to_pass_ratio:.3f} ({len(fail_to_pass)}/{total_originally_failing})")
+                            logger.info(f"[SCORING] Final score: {score:.3f}")
+                        else:
+                            # No originally failing tests (shouldn't happen in SWE-bench)
+                            # Check if there are any regressions
+                            if len(pass_to_fail) > 0:
+                                score = 0.0
+                                logger.warning(f"No originally failing tests, but {len(pass_to_fail)} regressions found")
+                            else:
+                                score = 0.5  # Neutral score if no tests to fix and no regressions
+                                logger.warning("No originally failing tests to evaluate")
+                    
+                    # Fallback to old logic if new fields are not present
+                    if not tests_passed and not tests_failed and test_results:
+                        logger.info("Using fallback scoring based on test_results")
+                        # Count passed tests for partial credit
+                        total_tests = len(test_results)
+                        passed_tests = sum(1 for result in test_results.values() if result == "PASSED")
+                        if total_tests > 0:
+                            partial_score = passed_tests / total_tests * 0.5  # Max 0.5 for partial success
+                            score = max(score, partial_score)
+                            logger.info(f"Fallback partial credit: {passed_tests}/{total_tests} tests passed = {partial_score}")
+                    
+                    return score
+                else:
+                    logger.error(f"[EVALUATION] Request failed with status {reward_response.status_code}")
+                    logger.error(f"[EVALUATION] Response: {reward_response.text[:500]}...")
+                    logger.debug(f"[DEBUG] Full response: {reward_response.text}")
+                    return 0.0
+                    
+        except httpx.TimeoutException as e:
+            logger.error(f"[EVALUATION] Timed out after 600 seconds: {e}")
+            logger.debug(f"[DEBUG] Timeout details: {str(e)}")
+            return 0.0
+        except Exception as e:
+            logger.error(f"[EVALUATION] Error during evaluation: {e}")
+            logger.debug(f"[DEBUG] Exception type: {type(e).__name__}")
+            logger.debug(f"[DEBUG] Exception details: {str(e)}")
+            import traceback
+            logger.debug(f"[DEBUG] Traceback:\n{traceback.format_exc()}")
+            return 0.0
+    
+    # Run the async evaluation
+    try:
+        # Check if we're already in an event loop
+        try:
+            loop = asyncio.get_running_loop()
+            logger.debug("[DEBUG] Already in event loop, using nest_asyncio to allow nested async execution")
+            # Use nest_asyncio to allow nested event loops
+            import nest_asyncio
+            nest_asyncio.apply()
+            # Now we can run the async function even in an existing loop
+            score = asyncio.run(evaluate_patch())
+            logger.info(f"[COMPUTE_SCORE] Returning final score: {score:.3f} for {instance_id}")
+            return score
+        except RuntimeError:
+            # No event loop running, we can use asyncio.run()
+            logger.debug("[DEBUG] No event loop running, using asyncio.run()")
+            score = asyncio.run(evaluate_patch())
+            logger.info(f"[COMPUTE_SCORE] Returning final score: {score:.3f} for {instance_id}")
+            return score
+    except ImportError as e:
+        logger.error("[COMPUTE_SCORE] nest_asyncio not installed. Install with: pip install nest-asyncio")
+        logger.error("[COMPUTE_SCORE] Falling back to synchronous evaluation with httpx")
+        # Fallback to synchronous evaluation
+        import httpx
+        try:
+            with httpx.Client(timeout=600) as client:
+                logger.info(f"[EVALUATION] Submitting patch for SYNC evaluation to {modal_evaluation_url}")
+                request_payload = {
+                    "instance_id": instance_id,
+                    "patch": solution_patch,
+                    "dataset_name": dataset_name,
+                    "split": split,
+                    "run_id": run_id
+                }
+                response = client.post(f"{modal_evaluation_url}/evaluate", json=request_payload)
+                if response.status_code == 200:
+                    reward_data = response.json()
+                    if not reward_data.get("success", False):
+                        logger.error(f"[EVALUATION] Failed: {reward_data.get('error', 'Unknown error')}")
+                        return 0.0
+                    
+                    # Use simplified scoring for sync fallback
+                    resolved = reward_data.get("resolved", False)
+                    score = 1.0 if resolved else 0.0
+                    logger.info(f"[EVALUATION] Sync evaluation completed. Resolved: {resolved}, Score: {score}")
+                    return score
+                else:
+                    logger.error(f"[EVALUATION] Sync request failed with status {response.status_code}")
+                    return 0.0
+        except Exception as sync_e:
+            logger.error(f"[EVALUATION] Sync evaluation also failed: {sync_e}")
+            return 0.0
+    except Exception as e:
+        logger.error(f"[COMPUTE_SCORE] Failed to run evaluation: {e}")
+        logger.debug(f"[DEBUG] Exception during asyncio execution: {type(e).__name__}: {str(e)}")
     return 0.0
 
 
@@ -270,3 +603,4 @@ class OrchestratorRewardModel(nn.Module):
     
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Use compute_score function instead")
+

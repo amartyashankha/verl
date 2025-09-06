@@ -317,8 +317,13 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         cls.truncation_max_tokens = config.actor_rollout_ref.rollout.multi_turn.get("truncation_max_tokens", 16000)
         cls.enable_truncation = True
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
-        cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
-        cls.response_length = config.actor_rollout_ref.rollout.response_length
+        # Get prompt and response lengths from config
+        cls.prompt_length = getattr(config.actor_rollout_ref.rollout, 'prompt_length', 
+                                    getattr(config.data, 'max_prompt_length', 4096))
+        cls.response_length = getattr(config.actor_rollout_ref.rollout, 'response_length',
+                                      getattr(config.data, 'max_response_length', 2000))
+        
+        logger.info(f"Configured prompt_length: {cls.prompt_length}, response_length: {cls.response_length}")
         # Build a stable prefix token sequence for later offsetting tool response ids.
         # Some chat templates require a valid message with a role.
         try:
@@ -674,13 +679,29 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         """Generate text using oracle messages (replay assistant responses)"""
         from verl.workers.rollout.async_server import TokenOutput
         
+        # Check if oracle messages are available
+        if not self.oracle_messages:
+            logger.warning("No oracle messages available - returning fallback response")
+            # Return a minimal fallback response to avoid empty tensor issues
+            fallback_text = "I cannot provide a solution as oracle data is not available for this task."
+            response_ids = self.tokenizer.encode(fallback_text, add_special_tokens=False)
+            # Use proper log probabilities (log space, not raw probabilities)
+            import math
+            log_probs = [math.log(0.5)] * len(response_ids) if response_ids else None
+            return TokenOutput(token_ids=response_ids, log_probs=log_probs)
+        
         # Find next assistant message to replay
         assistant_messages = [msg for msg in self.oracle_messages if msg.get("role") == "assistant"]
         
         if self.oracle_assistant_index >= len(assistant_messages):
             logger.warning(f"Oracle assistant index {self.oracle_assistant_index} exceeds available assistant messages ({len(assistant_messages)})")
-            # Return empty response when we run out of oracle messages
-            return TokenOutput(token_ids=[], log_probs=None)
+            # Return a minimal fallback response instead of empty to avoid IndexError
+            fallback_text = "Oracle messages exhausted - no more assistant responses available."
+            response_ids = self.tokenizer.encode(fallback_text, add_special_tokens=False)
+            # Use proper log probabilities (log space, not raw probabilities)
+            import math
+            log_probs = [math.log(0.5)] * len(response_ids) if response_ids else None
+            return TokenOutput(token_ids=response_ids, log_probs=log_probs)
         
         # Get the current assistant message to replay
         current_message = assistant_messages[self.oracle_assistant_index]
@@ -707,10 +728,11 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         # Tokenize the oracle response
         response_ids = self.tokenizer.encode(content, add_special_tokens=False)
         
-        # Generate dummy log probabilities (as requested: 0.5 for each token)
-        # Note: log_probs should be len(response_ids) - 1 if we exclude the first token
-        # But based on the user's comment, let's use len(response_ids) for now
-        log_probs = [0.5] * len(response_ids) if response_ids else None
+        # Generate log probabilities in log space (not raw probabilities)
+        # Using log(0.5) ≈ -0.693 as a placeholder for oracle responses
+        # Note: These are dummy values since we're replaying oracle messages
+        import math
+        log_probs = [math.log(0.5)] * len(response_ids) if response_ids else None
         
         logger.info(f"Oracle generated {len(response_ids)} tokens with {len(log_probs) if log_probs else 0} log_probs")
         
@@ -914,6 +936,25 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        """
+        CRITICAL PPO TRAINING NOTES (Jeffrey):
+        
+        1. response_mask and response_logprobs accumulate ALL assistant responses throughout
+           the entire conversation. They are NEVER reset, even after truncation.
+           
+        2. Truncation only affects the conversation context used for the NEXT generation.
+           It does NOT affect the accumulated training data.
+           
+        3. response_mask values:
+           - 1 for assistant tokens (trainable)
+           - 0 for tool/user response tokens (non-trainable)
+           
+        4. response_logprobs for non-trainable tokens are set to -inf to ensure they
+           don't contribute to gradients during PPO training.
+           
+        5. The final output contains ALL tokens generated during the conversation,
+           preserving the complete trajectory for PPO advantage computation.
+        """
         instance_id = kwargs.get("instance_id", "default_instance")
         logger.info(f"🚀 OrchestratorCodingAgentLoop.run() started for instance: {instance_id}")
         logger.info(f"   Oracle generation enabled: {self.use_oracle_generation}")
@@ -1012,6 +1053,8 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
+        # CRITICAL: These accumulate ALL responses throughout the conversation
+        # They should NEVER be reset, even after truncation
         response_mask, response_logprobs = [], []
         # tools_kwargs = kwargs.get("tools_kwargs", {})  # TOREVIEW (Shankha): Not using tools_kwargs
 
@@ -1020,100 +1063,113 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
             
             # TOREVIEW (Jeffrey): Process initial assistant messages to extract and execute code
-            # Similar to leader_agent.py lines 507-531
-            logger.info("Processing initial assistant messages for code execution...")
+            # IMPORTANT: If there are initial assistant messages in the conversation,
+            # we need to track them in response_mask and response_logprobs for training
+            logger.info("Processing initial messages...")
             logger.info(f"Total initial messages: {len(conversation_messages)}")
-            for i, msg in enumerate(conversation_messages):
-                logger.info(f"Message {i}: role='{msg.get('role')}', content_length={len(msg.get('content', ''))}")
-                if msg.get('role') == 'assistant' or (i == 0):
-                    logger.info(f"Processing message {i} for code extraction (role: {msg.get('role')})")
-                    # Extract code from assistant message content
-                    code_blocks = self.extract_code_from_response(msg.get('content', ''))
-                    logger.info(f"Extracted {len(code_blocks)} code blocks from message {i}")
-                    if code_blocks:
-                        logger.info(f"Found {len(code_blocks)} code block(s) in initial assistant message {i}, executing...")
-                        for j, code_block in enumerate(code_blocks):
-                            try:
-                                # Execute code via Modal API
-                                exec_response = await client.post(
-                                    self._endpoint("execute-cell"),
-                                    json={
-                                        "instance_id": instance_id,
-                                        "run_id": run_id,
-                                        "notebook_id": notebook_id,
-                                        "cell_content": code_block.strip()
-                                    }
-                                )
-                                exec_data = exec_response.json()
-                                
-                                logger.info(f"Initial message {i} code block {j+1} execution result: "
-                                          f"Success: {exec_data.get('success')}")
-                                if exec_data.get('stdout'):
-                                    logger.info(f"STDOUT: {exec_data['stdout'][:500]}...")  # Log first 500 chars
-                                if exec_data.get('stderr'):
-                                    logger.info(f"STDERR: {exec_data['stderr'][:500]}...")  # Log first 500 chars
+            
+            # Check if we have any initial assistant messages to process
+            has_initial_assistant = any(msg.get('role') == 'assistant' for msg in conversation_messages)
+            
+            if has_initial_assistant:
+                logger.info("Found initial assistant messages - tracking for training")
+                # We need to tokenize and track these initial assistant messages
+                # Note: This assumes the initial messages are already part of prompt_ids
+                # and we need to extract which portions are assistant vs user
+                
+                # For now, just execute any code blocks found
+                for i, msg in enumerate(conversation_messages):
+                    logger.info(f"Message {i}: role='{msg.get('role')}', content_length={len(msg.get('content', ''))}")
+                    if msg.get('role') == 'assistant':
+                        logger.info(f"Processing assistant message {i} for code extraction")
+                        
+                        # TODO: We should tokenize this message and add to response tracking
+                        # For now, just extract and execute code
+                        code_blocks = self.extract_code_from_response(msg.get('content', ''))
+                        logger.info(f"Extracted {len(code_blocks)} code blocks from message {i}")
+                        
+                        if code_blocks:
+                            logger.info(f"Found {len(code_blocks)} code block(s) in initial assistant message {i}, executing...")
+                            for j, code_block in enumerate(code_blocks):
+                                try:
+                                    # Execute code via Modal API
+                                    exec_response = await client.post(
+                                        self._endpoint("execute-cell"),
+                                        json={
+                                            "instance_id": instance_id,
+                                            "run_id": run_id,
+                                            "notebook_id": notebook_id,
+                                            "cell_content": code_block.strip()
+                                        }
+                                    )
+                                    exec_data = exec_response.json()
                                     
-                            except Exception as e:
-                                logger.error(f"Failed to execute code from initial assistant message {i}, block {j+1}: {e}")
-                    else:
-                        logger.info(f"No code found in initial assistant message {i}")
+                                    logger.info(f"Initial message {i} code block {j+1} execution result: "
+                                              f"Success: {exec_data.get('success')}")
+                                    if exec_data.get('stdout'):
+                                        logger.info(f"STDOUT: {exec_data['stdout'][:500]}...")  # Log first 500 chars
+                                    if exec_data.get('stderr'):
+                                        logger.info(f"STDERR: {exec_data['stderr'][:500]}...")  # Log first 500 chars
+                                        
+                                except Exception as e:
+                                    logger.error(f"Failed to execute code from initial assistant message {i}, block {j+1}: {e}")
+                        else:
+                            logger.info(f"No code found in initial assistant message {i}")
             
             while True:
                 # TOREVIEW (Shankha): Apply truncation before generation if enabled
-                # This ensures we don't exceed context limits during training
-                if self.enable_truncation and len(prompt_ids) > self.truncation_max_tokens:
-                    logger.info(f"Prompt length {len(prompt_ids)} exceeds truncation threshold, applying truncation")
-                    
-                    # Apply truncation to conversation messages
-                    truncated_messages = await self._apply_truncation(conversation_messages)
-                    
-                    # Re-tokenize the truncated conversation
-                    # TOREVIEW (Jeffrey): Added lru_cache for tokenization caching
-                    if self.processor is not None:
-                        if self.enable_tokenization_cache and self._cached_apply_chat_template:
-                            # caching on
-                            messages_tuple = tuple(truncated_messages)
-                            kwargs_tuple = tuple(sorted(self.apply_chat_template_kwargs.items()))
-                            raw_prompt = await self.loop.run_in_executor(
-                                None,
-                                lambda: self._cached_apply_chat_template(messages_tuple, kwargs_tuple)
-                            )
+                # IMPORTANT: Truncation only affects the context for next generation,
+                # NOT the accumulated responses we're training on
+                if self.enable_truncation:
+                    # Check if current conversation context exceeds limits
+                    context_tokens = await self._tokenize_messages(conversation_messages)
+                    if len(context_tokens) > self.truncation_max_tokens:
+                        logger.info(f"Context length {len(context_tokens)} exceeds truncation threshold, applying truncation")
+                        
+                        # Apply truncation to conversation messages for next generation
+                        truncated_messages = await self._apply_truncation(conversation_messages)
+                        
+                        # Update conversation messages to reflect truncation
+                        conversation_messages = truncated_messages
+                        
+                        # Re-tokenize the truncated conversation for next generation
+                        # TOREVIEW (Jeffrey): Added lru_cache for tokenization caching
+                        if self.processor is not None:
+                            if self.enable_tokenization_cache and self._cached_apply_chat_template:
+                                # caching on
+                                messages_tuple = tuple(truncated_messages)
+                                kwargs_tuple = tuple(sorted(self.apply_chat_template_kwargs.items()))
+                                raw_prompt = await self.loop.run_in_executor(
+                                    None,
+                                    lambda: self._cached_apply_chat_template(messages_tuple, kwargs_tuple)
+                                )
+                            else:
+                                # caching off
+                                raw_prompt = await self.loop.run_in_executor(
+                                    None,
+                                    lambda: self.processor.apply_chat_template(
+                                        truncated_messages,
+                                        add_generation_prompt=True,
+                                        tokenize=False,
+                                        **self.apply_chat_template_kwargs,
+                                    ),
+                                )
+                            model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+                            prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
                         else:
-                            # caching off
-                            raw_prompt = await self.loop.run_in_executor(
+                            prompt_ids = await self.loop.run_in_executor(
                                 None,
-                                lambda: self.processor.apply_chat_template(
+                                lambda: self.tokenizer.apply_chat_template(
                                     truncated_messages,
                                     add_generation_prompt=True,
-                                    tokenize=False,
+                                    tokenize=True,
                                     **self.apply_chat_template_kwargs,
                                 ),
                             )
-                    else:
-                        prompt_ids = await self.loop.run_in_executor(
-                            None,
-                            lambda: self.tokenizer.apply_chat_template(
-                                truncated_messages,
-                                add_generation_prompt=True,
-                                tokenize=True,
-                                **self.apply_chat_template_kwargs,
-                            ),
-                        )
-                    
-                    # Update conversation messages to reflect truncation
-                    conversation_messages = truncated_messages
-                    
-                    # TOREVIEW (Shankha): CRITICAL - Response mask needs to be rebuilt after truncation
-                    # TODO (Shankha): This is complex - we need to track which parts of the truncated
-                    # conversation correspond to assistant vs tool responses
-                    # For now, we'll have to regenerate from this point
-                    logger.warning("Truncation applied - response mask and log probs will be regenerated from this point")
-                    response_mask = []
-                    response_logprobs = []
-                    
-                    # TOREVIEW (Shankha): After truncation, the model will regenerate responses
-                    # with the compacted context, so log_probs will be consistent with the
-                    # truncated prompt. This is the key insight from multi_turn_data_storage_correction.md
+                        
+                        logger.info(f"Truncation applied to context, but preserving all {len(response_mask)} response tokens for training")
+                        # CRITICAL: We do NOT reset response_mask or response_logprobs here!
+                        # We continue accumulating all responses regardless of truncation
                 
                 with simple_timer("generate_sequences", metrics):
                     if self.use_modal_endpoint:
@@ -1321,8 +1377,15 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
 
                 prompt_ids += tool_response_ids # interleaved, we only care about system messages here
                 response_mask += [0] * len(tool_response_ids)
-                if response_logprobs:
-                    response_logprobs += [0.0] * len(tool_response_ids) # need to get this from actual vllm server
+                # CRITICAL: Always maintain response_logprobs in sync with response_mask
+                # Even if response_logprobs was initially empty, we need to keep them aligned
+                if response_logprobs is not None:
+                    # Use -inf for non-trainable tokens (tool responses)
+                    # This ensures they don't contribute to gradients during PPO training
+                    response_logprobs += [float('-inf')] * len(tool_response_ids)
+                else:
+                    # If we don't have log probs yet, initialize with -inf for tool responses
+                    response_logprobs = [float('-inf')] * len(tool_response_ids)
                 user_turns += 1
 
         response_ids = prompt_ids[-len(response_mask) :]
@@ -1385,11 +1448,110 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     logger.error(f"Error terminating sandbox: {e}")
                     # Non-critical error - sandbox will eventually timeout
         
-        # TOREVIEW (Shankha): Include solution patch in metrics for reward computation
-        # TODO (Shankha): Consider if this is the best way to pass the solution
-        # Alternative: Add to non_tensor_batch in DataProto later in the pipeline
+        # Compute reward score directly here instead of passing through pipeline
+        reward_score = 0.0
+        if solution_patch:
+            logger.info(f"[REWARD] Computing reward for {instance_id} with patch length {len(solution_patch)}")
+            try:
+                import httpx
+                modal_evaluation_url = kwargs.get("modal_evaluation_url", "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run")
+                dataset_name = kwargs.get("dataset_name", "SWE-Gym/SWE-Gym")
+                split = kwargs.get("split", "train")
+                run_id = kwargs.get("run_id", f"verl_eval_{instance_id}")
+                
+                with httpx.Client(timeout=600) as client:
+                    # Step 1: Submit the patch
+                    logger.info(f"[REWARD] Submitting patch to {modal_evaluation_url}/submit")
+                    submit_response = client.post(
+                        f"{modal_evaluation_url}/submit",
+                        json={
+                            "instance_id": instance_id,
+                            "patch": solution_patch,
+                            "run_id": run_id
+                        }
+                    )
+                    
+                    if submit_response.status_code == 200:
+                        submit_data = submit_response.json()
+                        call_id = submit_data.get("call_id")
+                        logger.info(f"[REWARD] Submitted successfully, call_id: {call_id}")
+                        
+                        # Step 2: Poll for result
+                        result_url = f"{modal_evaluation_url}/result/{call_id}"
+                        max_poll_time = 300  # 5 minutes max
+                        poll_interval = 3  # seconds
+                        start_time = time.time()
+                        
+                        while time.time() - start_time < max_poll_time:
+                            result_response = client.get(result_url)
+                            
+                            if result_response.status_code == 200:
+                                # Got result
+                                result_data = result_response.json()
+                                if result_data.get("success"):
+                                    test_results = result_data.get("test_results", {})
+                                    tests_status = test_results.get("tests_status", {})
+                                    
+                                    # Check if resolved (all tests pass)
+                                    fail_to_pass = tests_status.get("FAIL_TO_PASS", {}).get("failure", [])
+                                    pass_to_pass = tests_status.get("PASS_TO_PASS", {}).get("failure", [])
+                                    fail_to_fail = tests_status.get("FAIL_TO_FAIL", {}).get("success", [])
+                                    pass_to_fail = tests_status.get("PASS_TO_FAIL", {}).get("success", [])
+                                    
+                                    resolved = (
+                                        len(fail_to_pass) == 0 and
+                                        len(pass_to_pass) == 0 and
+                                        len(fail_to_fail) == 0 and
+                                        len(pass_to_fail) == 0
+                                    )
+                                    
+                                    # Calculate partial score based on fail_to_pass
+                                    fail_to_pass_success = tests_status.get("FAIL_TO_PASS", {}).get("success", [])
+                                    fail_to_fail_failure = tests_status.get("FAIL_TO_FAIL", {}).get("failure", [])
+                                    total_originally_failing = len(fail_to_pass_success) + len(fail_to_pass) + len(fail_to_fail_failure) + len(fail_to_fail)
+                                    
+                                    if resolved:
+                                        reward_score = 1.0
+                                    elif total_originally_failing > 0:
+                                        reward_score = len(fail_to_pass_success) / total_originally_failing
+                                    else:
+                                        reward_score = 0.0
+                                    
+                                    logger.info(f"[REWARD] Score for {instance_id}: {reward_score:.3f} (resolved={resolved}, F2P={len(fail_to_pass_success)}/{total_originally_failing})")
+                                else:
+                                    logger.error(f"[REWARD] Evaluation failed: {result_data.get('error')}")
+                                break
+                                
+                            elif result_response.status_code == 202:
+                                # Still processing
+                                logger.debug(f"[REWARD] Still processing {call_id}, polling again...")
+                                time.sleep(poll_interval)
+                                
+                            elif result_response.status_code == 404:
+                                logger.error(f"[REWARD] Result not found or expired for {call_id}")
+                                break
+                                
+                            else:
+                                logger.error(f"[REWARD] Unexpected status {result_response.status_code} when polling")
+                                break
+                        else:
+                            logger.error(f"[REWARD] Polling timeout after {max_poll_time}s")
+                    else:
+                        logger.error(f"[REWARD] Submit failed with HTTP {submit_response.status_code}")
+            except Exception as e:
+                logger.error(f"[REWARD] Error computing reward: {e}")
+        else:
+            logger.info(f"[REWARD] No solution patch for {instance_id}, using reward=0.0")
+        
+        # Still include in metrics for logging
         metrics["solution_patch"] = solution_patch
         metrics["solution_metadata"] = solution_metadata
+        metrics["reward_score"] = reward_score
+        
+        # Ensure prompt_ids don't exceed max length to avoid tensor size mismatch
+        if len(prompt_ids) > self.prompt_length:
+            logger.warning(f"Truncating prompt_ids from {len(prompt_ids)} to {self.prompt_length}")
+            prompt_ids = prompt_ids[: self.prompt_length]
         
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -1399,6 +1561,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             num_turns=user_turns + assistant_turns + 1,
             metrics=metrics,
+            reward_score=reward_score,  # Pass the computed reward directly
         )
         return output
 
@@ -1539,28 +1702,28 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         logger.info(f"   Task prompt length: {len(task_prompt)} chars")
         logger.info(f"   Task prompt preview: {task_prompt[:200]}...")
         
+        # Build first cell (same as run_oracle_task.py) - MUST happen before checking oracle messages
+        full_prompt, first_cell_code = build_full_prompt_for_first_cell(task_prompt)
+        logger.info(f"📝 Built first cell prompt: {len(full_prompt)} chars")
+        
         # Load oracle messages for this instance
         self._ensure_oracle_loaded_for_instance(instance_id)
         
         # Check if oracle messages were loaded
         if not self.oracle_messages:
-            logger.error("❌ No oracle messages loaded, cannot proceed with oracle mode")
-            # Return empty output
+            logger.warning(f"⚠️ No oracle messages for {instance_id}, skipping (this is expected for new instances)")
+            # Just return minimal valid output - don't try to generate anything
             return AgentLoopOutput(
-                prompt_ids=[],
-                response_ids=[],
-                response_mask=[],
+                prompt_ids=[1],  # Minimal valid prompt
+                response_ids=[1],  # Minimal valid response  
+                response_mask=[1],  # Minimal valid mask
                 multi_modal_data={},
-                response_logprobs=None,
-                num_turns=0,
-                metrics={"error": "No oracle messages loaded"},
+                response_logprobs=[0.0],  # Minimal valid log prob
+                num_turns=1,
+                metrics={"skipped": True, "reason": "no_oracle", "solution_patch": "", "instance_id": instance_id},
             )
         
         logger.info(f"✅ Oracle messages loaded: {len(self.oracle_messages)} total messages")
-        
-        # Build first cell (same as run_oracle_task.py)
-        full_prompt, first_cell_code = build_full_prompt_for_first_cell(task_prompt)
-        logger.info(f"📝 Built first cell prompt: {len(full_prompt)} chars")
         
         # Create initial messages for tokenization
         messages = [{"role": "user", "content": full_prompt}]
@@ -1612,10 +1775,100 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         logger.info("🔍 Extracting solution patch from oracle messages...")
         solution_patch = self._extract_solution_from_oracle_messages()
         
-        # Log solution patch status
-        if solution_patch and solution_patch != "No solution patch found in oracle messages" and solution_patch != "No oracle messages loaded":
+        # Compute reward score for oracle mode
+        reward_score = 0.0
+        if solution_patch and solution_patch not in ["No solution patch found in oracle messages", "No oracle messages loaded", "No solution patch found"]:
             logger.info(f"✅ Solution patch extracted: {len(solution_patch)} chars")
             logger.info(f"   Solution preview: {solution_patch[:200]}...")
+            
+            # Compute reward using the same logic as normal mode
+            try:
+                import httpx
+                modal_evaluation_url = kwargs.get("modal_evaluation_url", "https://fairies--swe-gym-evaluation-service-polling-fastapi-app.modal.run")
+                dataset_name = kwargs.get("dataset_name", "SWE-Gym/SWE-Gym")
+                split = kwargs.get("split", "train")
+                run_id = kwargs.get("run_id", f"verl_eval_{instance_id}")
+                
+                with httpx.Client(timeout=600) as client:
+                    logger.info(f"[ORACLE REWARD] Submitting to {modal_evaluation_url}/submit")
+                    submit_response = client.post(
+                        f"{modal_evaluation_url}/submit",
+                        json={
+                            "instance_id": instance_id,
+                            "patch": solution_patch,
+                            "run_id": run_id
+                        }
+                    )
+                    
+                    if submit_response.status_code == 200:
+                        submit_data = submit_response.json()
+                        call_id = submit_data.get("call_id")
+                        logger.info(f"[ORACLE REWARD] Submitted successfully, call_id: {call_id}")
+                        
+                        # Step 2: Poll for result
+                        result_url = f"{modal_evaluation_url}/result/{call_id}"
+                        max_poll_time = 300  # 5 minutes max
+                        poll_interval = 3  # seconds
+                        start_time = time.time()
+                        
+                        while time.time() - start_time < max_poll_time:
+                            result_response = client.get(result_url)
+                            
+                            if result_response.status_code == 200:
+                                # Got result
+                                result_data = result_response.json()
+                                if result_data.get("success"):
+                                    test_results = result_data.get("test_results", {})
+                                    tests_status = test_results.get("tests_status", {})
+                                    
+                                    # Check if resolved (all tests pass)
+                                    fail_to_pass = tests_status.get("FAIL_TO_PASS", {}).get("failure", [])
+                                    pass_to_pass = tests_status.get("PASS_TO_PASS", {}).get("failure", [])
+                                    fail_to_fail = tests_status.get("FAIL_TO_FAIL", {}).get("success", [])
+                                    pass_to_fail = tests_status.get("PASS_TO_FAIL", {}).get("success", [])
+                                    
+                                    resolved = (
+                                        len(fail_to_pass) == 0 and
+                                        len(pass_to_pass) == 0 and
+                                        len(fail_to_fail) == 0 and
+                                        len(pass_to_fail) == 0
+                                    )
+                                    
+                                    # Calculate partial score based on fail_to_pass
+                                    fail_to_pass_success = tests_status.get("FAIL_TO_PASS", {}).get("success", [])
+                                    fail_to_fail_failure = tests_status.get("FAIL_TO_FAIL", {}).get("failure", [])
+                                    total_originally_failing = len(fail_to_pass_success) + len(fail_to_pass) + len(fail_to_fail_failure) + len(fail_to_fail)
+                                    
+                                    if resolved:
+                                        reward_score = 1.0
+                                    elif total_originally_failing > 0:
+                                        reward_score = len(fail_to_pass_success) / total_originally_failing
+                                    else:
+                                        reward_score = 0.0
+                                    
+                                    logger.info(f"[ORACLE REWARD] Score for {instance_id}: {reward_score:.3f} (resolved={resolved}, F2P={len(fail_to_pass_success)}/{total_originally_failing})")
+                                else:
+                                    logger.error(f"[ORACLE REWARD] Evaluation failed: {result_data.get('error')}")
+                                break
+                                
+                            elif result_response.status_code == 202:
+                                # Still processing
+                                logger.debug(f"[ORACLE REWARD] Still processing {call_id}, polling again...")
+                                time.sleep(poll_interval)
+                                
+                            elif result_response.status_code == 404:
+                                logger.error(f"[ORACLE REWARD] Result not found or expired for {call_id}")
+                                break
+                                
+                            else:
+                                logger.error(f"[ORACLE REWARD] Unexpected status {result_response.status_code} when polling")
+                                break
+                        else:
+                            logger.error(f"[ORACLE REWARD] Polling timeout after {max_poll_time}s")
+                    else:
+                        logger.error(f"[ORACLE REWARD] Submit failed with HTTP {submit_response.status_code}")
+            except Exception as e:
+                logger.error(f"[ORACLE REWARD] Error computing reward: {e}")
         else:
             logger.warning(f"⚠️ No valid solution patch found: {solution_patch}")
         
@@ -1631,6 +1884,11 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         logger.info(f"   Solution patch length: {len(solution_patch) if solution_patch else 0}")
         logger.info(f"   Instance ID: {instance_id}")
         
+        # Ensure prompt_ids don't exceed max length to avoid tensor size mismatch
+        if len(prompt_ids) > self.prompt_length:
+            logger.warning(f"[ORACLE] Truncating prompt_ids from {len(prompt_ids)} to {self.prompt_length}")
+            prompt_ids = prompt_ids[: self.prompt_length]
+        
         # Return simplified output
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -1640,6 +1898,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             num_turns=1,  # Oracle mode is single turn
             metrics=metrics,
+            reward_score=reward_score,  # Pass the computed reward directly
         )
         
         logger.info("🔮 ORACLE MODE COMPLETE")
