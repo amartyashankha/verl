@@ -83,7 +83,7 @@ max_response_length=2000  # Larger for notebook outputs
 max_model_len=32768  # Model's maximum context length
 actor_lr=1e-7
 
-train_batch_size=4  # Reduce for 14B model (32 default)
+train_batch_size=8  # Reduce for 14B model (32 default)
 ppo_mini_batch_size=1  # Reduce for 14B model (8 default)
 n_resp_per_prompt=1  # Reduce for 14B model (4 default)
 n_resp_per_prompt_val=1  # Reduce for 14B model (8 default)
@@ -103,10 +103,10 @@ if [[ "${DEBUG_MODE:-false}" == "true" ]]; then
     val_batch_size=1  # Must be <= number of validation examples (1)
     n_resp_per_prompt=1
     n_resp_per_prompt_val=1
-    # Use fewer tensor parallel workers (faster loading)
-    infer_tp=4
     # Skip validation initially  
     val_before_train=False
+    # Use fewer GPUs for 0.5B model
+    export N_GPUS=8  # Only use 2 GPUs instead of 8
 fi
 
 # Truncation settings
@@ -115,8 +115,14 @@ truncation_strategy="ast_llm_compaction"  # or "first_user_priority"
 truncation_max_tokens=16000
 
 # ================= performance =================
-infer_tp=8  # vllm tensor parallel - increase for 14B model
-train_sp=8  # train sequence parallel - increase for 14B model
+# For 0.5B model, we can use much smaller parallelism
+if [[ "${DEBUG_MODE:-false}" == "true" ]]; then
+    infer_tp=1  # No tensor parallel needed for 0.5B model
+    train_sp=1  # No sequence parallel needed for 0.5B model
+else
+    infer_tp=8  # vllm tensor parallel - increase for 14B model
+    train_sp=8  # train sequence parallel - increase for 14B model
+fi
 offload=False
 
 # actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) / 2 ))
@@ -191,14 +197,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
     critic.model.path=$model_path \
     critic.strategy=fsdp \
+    critic.ppo_mini_batch_size=$ppo_mini_batch_size \
     trainer.logger=['console'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=8 \
-    trainer.val_before_train=True \
+    trainer.n_gpus_per_node=${N_GPUS:-8} \
+    trainer.val_before_train=${val_before_train:-True} \
     trainer.log_val_generations=10 \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
+    trainer.save_freq=1 \
     trainer.default_local_dir=$default_local_dir \
     trainer.test_freq=5 \
     trainer.total_epochs=1 $@

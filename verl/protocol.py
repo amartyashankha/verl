@@ -104,6 +104,14 @@ def unpad_dataproto(data: "DataProto", pad_size):
 
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
     """Union two tensordicts."""
+    # Handle None cases - common when orchestrator dataset has no tensor data
+    if tensor_dict1 is None and tensor_dict2 is None:
+        return None
+    if tensor_dict1 is None:
+        return tensor_dict2
+    if tensor_dict2 is None:
+        return tensor_dict1
+    
     assert tensor_dict1.batch_size == tensor_dict2.batch_size, (
         f"Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}"
     )
@@ -759,6 +767,48 @@ class DataProto:
         Returns:
             List[DataProto]: a list of DataProto after splitting
         """
+        # Handle case where batch size < chunks
+        if len(self) < chunks:
+            import warnings
+            warnings.warn(
+                f"Batch size ({len(self)}) is smaller than number of chunks ({chunks}). "
+                f"Some workers will receive empty batches. Consider using fewer GPUs or larger batch size."
+            )
+            # Create list with actual data for first few chunks and empty for the rest
+            result = []
+            for i in range(chunks):
+                if i < len(self):
+                    # Create single-item chunks for available data
+                    sliced_batch = self.batch[i:i+1] if self.batch is not None else None
+                    sliced_non_tensor = {}
+                    if self.non_tensor_batch:
+                        for key, val in self.non_tensor_batch.items():
+                            if hasattr(val, '__getitem__'):
+                                sliced_non_tensor[key] = [val[i]] if i < len(val) else []
+                            else:
+                                sliced_non_tensor[key] = val
+                    result.append(DataProto(
+                        batch=sliced_batch,
+                        non_tensor_batch=sliced_non_tensor,
+                        meta_info=self.meta_info
+                    ))
+                else:
+                    # Create empty DataProto for workers without data
+                    empty_batch = self.batch[0:0] if self.batch is not None else None
+                    empty_non_tensor = {}
+                    if self.non_tensor_batch:
+                        for key, val in self.non_tensor_batch.items():
+                            if hasattr(val, '__getitem__'):
+                                empty_non_tensor[key] = []
+                            else:
+                                empty_non_tensor[key] = val
+                    result.append(DataProto(
+                        batch=empty_batch,
+                        non_tensor_batch=empty_non_tensor,
+                        meta_info=self.meta_info
+                    ))
+            return result
+        
         if not self.is_padding_enabled():
             assert len(self) % chunks == 0, (
                 f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."

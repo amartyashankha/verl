@@ -746,11 +746,23 @@ class AgentLoopManager:
         """
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        
+        # Handle case where batch size is smaller than number of workers
+        batch_size = len(prompts)
+        num_workers = len(self.agent_loop_workers)
+        
+        if batch_size < num_workers:
+            # Use fewer workers when batch is small
+            active_workers = self.agent_loop_workers[:batch_size]
+            chunkes = prompts.chunk(batch_size)  # One sample per worker
+        else:
+            # Normal case: distribute across all workers
+            active_workers = self.agent_loop_workers
+            chunkes = prompts.chunk(num_workers)
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                for worker, chunk in zip(active_workers, chunkes, strict=True)
             ]
         )
         output = DataProto.concat(outputs)
@@ -777,12 +789,21 @@ class AgentLoopManager:
 
         # batch sequence generation is bounded by the slowest sample
         slowest = np.argmax(t_generate_sequences + t_tool_calls)
-        attention_mask = output.batch["attention_mask"][slowest]
-        prompt_length = output.batch["prompts"].shape[1]
-        timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
-        timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
-        timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
-        timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+        
+        # Check if batch has the expected fields before accessing them
+        if output.batch is not None and "attention_mask" in output.batch and "prompts" in output.batch:
+            attention_mask = output.batch["attention_mask"][slowest]
+            prompt_length = output.batch["prompts"].shape[1]
+            timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+            timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
+            timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
+            timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+        else:
+            # Fallback when batch doesn't have expected fields
+            timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+            timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
+            timing["agent_loop/slowest/prompt_length"] = 0
+            timing["agent_loop/slowest/response_length"] = 0
 
         return timing
 

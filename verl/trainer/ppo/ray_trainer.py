@@ -1053,8 +1053,16 @@ class RayPPOTrainer:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg.world_size
+        
+        # Skip balancing if batch size is smaller than world size
+        # This can happen with small datasets or during debugging
+        if batch_size < world_size:
+            print(f"  ⚠️ Skipping batch balancing: batch_size ({batch_size}) < world_size ({world_size})")
+            print(f"     Consider using a larger batch size or fewer GPUs for better efficiency")
+            return
+        
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         global_partition_lst = get_seqlen_balanced_partitions(
             global_seqlen_lst, k_partitions=world_size, equal_size=True
         )
@@ -1179,17 +1187,40 @@ class RayPPOTrainer:
                 )
 
                 gen_batch = self._get_gen_batch(batch)
-
+                
+                # Debug logging for orchestrator dataset
+                print(f"  DEBUG: After _get_gen_batch:")
+                print(f"    - gen_batch.batch is None: {gen_batch.batch is None}")
+                print(f"    - gen_batch.non_tensor_batch keys: {list(gen_batch.non_tensor_batch.keys()) if gen_batch.non_tensor_batch else 'None'}")
+                
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                
+                print(f"  DEBUG: After repeat:")
+                print(f"    - gen_batch.batch is None: {gen_batch.batch is None}")
+                print(f"    - gen_batch.non_tensor_batch keys: {list(gen_batch.non_tensor_batch.keys()) if gen_batch.non_tensor_batch else 'None'}")
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        print(f"  📝 Generating sequences (batch size: {len(gen_batch.batch)}, n_responses: {self.config.actor_rollout_ref.rollout.n})...")
+                        # Handle case where gen_batch.batch is None (orchestrator dataset) (why??)
+                        if gen_batch.batch is not None:
+                            gen_batch_size = len(gen_batch.batch)
+                        else:
+                            # Get size from non_tensor_batch
+                            non_tensor_keys = list(gen_batch.non_tensor_batch.keys())
+                            if non_tensor_keys:
+                                first_item = gen_batch.non_tensor_batch[non_tensor_keys[0]]
+                                if hasattr(first_item, '__len__'):
+                                    gen_batch_size = len(first_item)
+                                else:
+                                    gen_batch_size = 1
+                            else:
+                                gen_batch_size = 1
+                        print(f"  📝 Generating sequences (batch size: {gen_batch_size}, n_responses: {self.config.actor_rollout_ref.rollout.n})...")
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
@@ -1197,6 +1228,12 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
                         print(f"  ✅ Generation complete (took {timing_raw.get('gen', 0):.2f}s)")
+                        
+                        # Debug logging for generation output
+                        print(f"  DEBUG: After generation:")
+                        print(f"    - gen_batch_output.batch is None: {gen_batch_output.batch is None}")
+                        if gen_batch_output.batch is not None:
+                            print(f"    - gen_batch_output.batch keys: {list(gen_batch_output.batch.keys())}")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1222,6 +1259,12 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    
+                    # Debug logging after union
+                    print(f"  DEBUG: After union:")
+                    print(f"    - batch.batch is None: {batch.batch is None}")
+                    if batch.batch is not None:
+                        print(f"    - batch.batch keys: {list(batch.batch.keys())}")
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
